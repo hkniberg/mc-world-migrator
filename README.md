@@ -79,51 +79,64 @@ silently lost — see "Auditing" below.
 2. Keep your **original 1.20.1 (Forge) save** — it is the source of truth.
 3. Let **1.21.1 / NeoForge open the world once** (this performs the vanilla
    migration), then quit. Make a copy of that migrated save to patch.
-4. Run the repair (default is a safe **dry-run**; add `--write` to apply):
+4. *(Optional but recommended for big worlds)* trim the copy to the chunks you
+   actually keep (e.g. with MCASelector); discarded chunks regenerate fresh in 1.21.
+5. Run the repair with `run` (parallel, resumable; default is a safe **dry-run**,
+   add `--write` to apply):
 
    ```bash
-   # dry-run first — shows what it would change
-   python migrate_world.py fix-all --source /path/to/1.20-original --target /path/to/migrated-copy
+   # dry-run first — processes regions, prints the custom_data audit, writes nothing
+   python migrate_world.py run --source /path/to/1.20-original --target /path/to/migrated-copy --jobs 20
 
    # then apply
-   python migrate_world.py fix-all --source /path/to/1.20-original --target /path/to/migrated-copy --write
+   python migrate_world.py run --source /path/to/1.20-original --target /path/to/migrated-copy --jobs 20 --write
    ```
 
    On Windows (PowerShell), quote paths with spaces:
 
    ```powershell
-   python migrate_world.py fix-all --source "C:\saves\1.20-original" --target "C:\saves\migrated-copy" --write
+   python migrate_world.py run --source "C:\saves\1.20-original" --target "C:\saves\migrated-copy" --jobs 20 --write
    ```
 
-5. Open the patched copy in 1.21. Re-place any train signals.
+6. Open the patched copy in 1.21. Re-place any train signals.
 
 The tool is **idempotent** — running it again changes nothing.
 
-## Subcommands
-
-`fix-all` runs everything. Individual fixers exist for targeted runs/debugging:
+### Primary commands
 
 ```
-index-source          preflight counts from the 1.20 source
-fix-inventories        generic count/contents restore across mod block entities
-fix-chain-conveyors    fix-tracks            fix-track-signals
-fix-fluid-tanks        fix-factory-panels    fix-table-cloths
-fix-clipboards         fix-postboxes         fix-paintings
-fix-item-frames        fix-package-entities
-fix-mod-items          mod items in vanilla containers (custom_data → components)
-fix-be-backpacks       fix-backpack-dat      fix-backpacks (rehome + worn)
-fix-all                everything, in order
-verify                 dev/testing only — compares a patched world to a hand-built
-                       1.21 reference (needs --ref); not used for real migrations
+run    parallel migration of the whole world across all dimensions, then the
+       global .dat/playerdata pass. Resumable (see below). Flags:
+         --jobs N      worker processes (default 20)
+         --only K ...  only these region keys, e.g. overworld.0.0 DIM-1.1.-2
+         --force       reprocess regions even if the manifest says done
+         --no-global   skip the .dat/playerdata pass
+region migrate a single region for testing / targeted rerun:
+         --coord <dim>.<rx>.<rz>   e.g. overworld.3.3   (dims: overworld, DIM-1, DIM1)
+global only the .dat + playerdata pass (uses pairs recorded in the manifest)
+verify dev/testing only — compares a patched world to a hand-built 1.21 reference
+       (needs --ref); not meaningful for real migrations
+fix-all single-threaded everything-in-one-process; fine for tiny worlds / fallback
 ```
 
-## Auditing what falls through (recommended before a real run)
+`fix-*` subcommands (e.g. `fix-tracks`, `fix-paintings`, `fix-inventories`) run an
+individual fixer over the whole world — handy for debugging.
 
-Do a dry-run `fix-all` and read the **"tag keys routed to custom_data"** report it
-prints. That is the complete list of item-NBT keys in *your* world that aren't yet
-mapped to a native component. If something valuable shows up (e.g. a component you
-care about), it can be added to the converter before you commit with `--write`.
-For most worlds this list is short (crossbows / player heads).
+### Resumability
+
+`run` writes a `migration_manifest.json` in the target world and marks each region
+done as it finishes (atomically). If it crashes after converting, say, 80 regions,
+just run the same command again — it **skips the 80 done regions** and continues.
+`--only <coord>` reprocesses specific regions; `--force` redoes everything. (Even a
+reprocessed region is safe — the fixers are idempotent.)
+
+### Auditing what falls through (recommended before a real run)
+
+A `run` prints **"item-NBT keys routed to custom_data"** at the end — the complete
+list of item-NBT keys in *your* world that aren't yet mapped to a native 1.21
+component. If something valuable shows up, it can be added to the converter before
+you commit with `--write`. For most worlds this list is short (crossbows / player
+heads).
 
 ## How it works
 
@@ -148,8 +161,11 @@ python tools/find_items.py     <world> "backpack"                   # find items
 
 ## Performance
 
-The current `fix-all` makes several full-world passes, so it can take minutes on a
-large world. It is correctness-first; a single-pass optimization is planned.
+`run` reads each chunk **once**, applies all fixers, and writes it once, with one
+worker **process per region** (regions are independent). On a 16-core/24-thread
+desktop a ~8,700-chunk test world migrates in ~15 s (the single-threaded `fix-all`
+took ~240 s for the same result — ~16× faster). Tune with `--jobs`. Memory is
+modest: each worker only loads its own region's source index.
 
 ## Safety
 

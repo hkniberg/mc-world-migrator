@@ -7,21 +7,31 @@ shops, clipboards, paintings, tracks, filters, complex item components, ...).
 
 See README.md for what is and isn't fixed, and the recommended workflow.
 
-Usage:
-    # dry-run (default) then apply with --write; always work on a COPY
-    python migrate_world.py fix-all --source <1.20_world> --target <migrated_copy> [--write]
+Usage (dry-run by default; always work on a COPY):
+    # parallel, resumable migration of the whole world (recommended)
+    python migrate_world.py run --source <1.20_world> --target <migrated_copy> --jobs 20 [--write]
 
-Run `python migrate_world.py -h` for the full list of subcommands. `fix-all`
-runs everything in order; the individual fixers exist for targeted runs. Default
-is a safe dry-run — pass --write to modify the target world. Idempotent.
+    # a single region (testing / targeted rerun)
+    python migrate_world.py region --coord overworld.3.3 --source <1.20> --target <copy> [--write]
+
+`run` reads each chunk once and processes regions in parallel, then does one global
+.dat/playerdata pass; it writes a migration_manifest.json so a crashed run resumes
+where it left off. `fix-all` is the single-threaded equivalent (fine for tiny
+worlds). Run `python migrate_world.py -h` for all subcommands. Idempotent.
+See README.md for what is and isn't fixed.
 """
 import argparse
 import sys
+import os
 import re
 import json
 import random
+import shutil
+import time
+import traceback
 from pathlib import Path
 from collections import defaultdict, Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from nbt import region, nbt as nbt_mod
 from nbt.nbt import (
@@ -235,10 +245,7 @@ def walk_region(target_dir, kind, visitor, dry_run):
 # ============================================================================
 # Fixer: chain conveyors (block_entities, region/)
 # ============================================================================
-def fix_chain_conveyors(target, sources, dry_run):
-    print("--- fix_chain_conveyors ---")
-    stats = Counter()
-
+def make_chain_conveyors_visitor(sources, stats):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -278,7 +285,13 @@ def fix_chain_conveyors(target, sources, dry_run):
             changed = True
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def fix_chain_conveyors(target, sources, dry_run):
+    print("--- fix_chain_conveyors ---")
+    stats = Counter()
+    walk_region(target, 'region', make_chain_conveyors_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -286,10 +299,7 @@ def fix_chain_conveyors(target, sources, dry_run):
 # ============================================================================
 # Fixer: tracks (block_entities, region/)
 # ============================================================================
-def fix_tracks(target, sources, dry_run):
-    print("--- fix_tracks ---")
-    stats = Counter()
-
+def make_tracks_visitor(sources, stats):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -360,7 +370,13 @@ def fix_tracks(target, sources, dry_run):
                 stats['unchanged_be'] += 1
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def fix_tracks(target, sources, dry_run):
+    print("--- fix_tracks ---")
+    stats = Counter()
+    walk_region(target, 'region', make_tracks_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -368,10 +384,7 @@ def fix_tracks(target, sources, dry_run):
 # ============================================================================
 # Fixer: track signals (block_entities, region/)
 # ============================================================================
-def fix_track_signals(target, sources, dry_run):
-    print("--- fix_track_signals ---")
-    stats = Counter()
-
+def make_track_signals_visitor(sources, stats):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -410,7 +423,13 @@ def fix_track_signals(target, sources, dry_run):
                     changed = True
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def fix_track_signals(target, sources, dry_run):
+    print("--- fix_track_signals ---")
+    stats = Counter()
+    walk_region(target, 'region', make_track_signals_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -431,10 +450,7 @@ def convert_painting_motive(m):
     return 'immersive_paintings:datapack/' + flat
 
 
-def fix_paintings(target, sources, dry_run):
-    print("--- fix_paintings ---")
-    stats = Counter()
-
+def make_paintings_visitor(sources, stats):
     def visit(chunk):
         ents = cget(chunk, 'Entities')
         if ents is None:
@@ -490,7 +506,13 @@ def fix_paintings(target, sources, dry_run):
                     changed = True
         return changed
 
-    walk_region(target, 'entities', visit, dry_run)
+    return visit
+
+
+def fix_paintings(target, sources, dry_run):
+    print("--- fix_paintings ---")
+    stats = Counter()
+    walk_region(target, 'entities', make_paintings_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -547,10 +569,7 @@ PRINTOUT_IDS = (
 )
 
 
-def fix_item_frames(target, sources, dry_run):
-    print("--- fix_item_frames ---")
-    stats = Counter()
-
+def make_item_frames_visitor(sources, stats):
     def visit(chunk):
         ents = cget(chunk, 'Entities')
         if ents is None:
@@ -605,7 +624,13 @@ def fix_item_frames(target, sources, dry_run):
             changed = True
         return changed
 
-    walk_region(target, 'entities', visit, dry_run)
+    return visit
+
+
+def fix_item_frames(target, sources, dry_run):
+    print("--- fix_item_frames ---")
+    stats = Counter()
+    walk_region(target, 'entities', make_item_frames_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -676,10 +701,7 @@ def is_backpack(item_id):
 # ============================================================================
 # Fixer: block-entity backpacks (region/) — restore storage_uuid from source
 # ============================================================================
-def fix_be_backpacks(target, sources, dry_run):
-    print("--- fix_be_backpacks ---")
-    stats = Counter()
-
+def make_be_backpacks_visitor(sources, stats):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -724,7 +746,13 @@ def fix_be_backpacks(target, sources, dry_run):
                 changed = True
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def fix_be_backpacks(target, sources, dry_run):
+    print("--- fix_be_backpacks ---")
+    stats = Counter()
+    walk_region(target, 'region', make_be_backpacks_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -840,6 +868,53 @@ def _bp_pick_empty(idx, claimed):
         if u not in claimed and not _bp_has_contents(e):
             return list(u)
     return None
+
+
+def _bp_collect_present(item, pairs, claimed, stats):
+    """Region-only: record this backpack's (storage_uuid S, contentsUuid O) for
+    the global .dat rehome, claim S, and clean the custom_data residue. Returns
+    True if the item was modified (so the region needs rewriting)."""
+    comps = cget(item, 'components')
+    if comps is None:
+        return False
+    S = cget(comps, 'sophisticatedcore:storage_uuid')
+    if S is None:
+        return False
+    claimed.append(list(S.value))
+    cd = cget(comps, 'minecraft:custom_data')
+    O = cget(cd, 'contentsUuid') if cd is not None else None
+    if O is not None and tuple(O.value) != tuple(S.value):
+        pairs.append((list(S.value), list(O.value)))
+        stats['region_backpack_pairs'] += 1
+    changed = False
+    if cd is not None:
+        for k in ('contentsUuid', 'inventorySlots', 'upgradeSlots', 'renderInfo'):
+            cdel(cd, k)
+        if len(cd.tags) == 0:
+            cdel(comps, 'minecraft:custom_data')
+        changed = True
+    return changed
+
+
+def make_backpack_collect_visitor(stats, pairs, claimed):
+    """Region visitor (parallel path): collect backpack (S,O) pairs and claimed
+    UUIDs; the actual .dat rehome happens once in migrate_global."""
+    def visit(chunk):
+        bes = cget(chunk, 'block_entities')
+        if bes is None:
+            return False
+        changed = [False]
+
+        def on_item(it):
+            idt = cget(it, 'id')
+            if idt is not None and isinstance(idt.value, str) and is_backpack(idt.value):
+                if _bp_collect_present(it, pairs, claimed, stats):
+                    changed[0] = True
+
+        walk_items(bes, on_item)
+        return changed[0]
+
+    return visit
 
 
 def fix_backpacks(target, sources, dry_run):
@@ -1598,14 +1673,26 @@ def _tgt_count(t):
 
 
 def _apply_stack(tgt, src, stats):
-    """Rewrite target stack from converted source if it differs. Idempotent."""
-    src_has_tag = cget(src, 'tag') is not None and len(cget(src, 'tag').tags) > 0
-    needs = (_tgt_count(tgt) != _src_count(src)) or \
-            (src_has_tag and cget(tgt, 'components') is None)
-    if not needs:
-        return False
+    """Update the target stack's count/components from the converted source, but
+    only when they actually differ — compare against the converted result so it
+    is truly idempotent (items whose 1.20 tag maps to empty components, e.g. a
+    tool with only Damage:0, no longer re-trigger forever). Preserves the
+    target's Slot and any extra fields."""
     conv = convert_item_1_20_to_1_21(src)
-    tgt.tags = conv.tags
+    conv_count = cget(conv, 'count')
+    conv_count_v = conv_count.value if conv_count is not None else 1
+    conv_comp = cget(conv, 'components')
+    if _tgt_count(tgt) == conv_count_v and nbt_equal(cget(tgt, 'components'), conv_comp):
+        return False
+    cset(tgt, 'count', make_int(conv_count_v))
+    cdel(tgt, 'Count')
+    if conv_comp is not None:
+        cset(tgt, 'components', conv_comp)
+    else:
+        cdel(tgt, 'components')
+    cid = cget(conv, 'id')
+    if cid is not None:
+        cset(tgt, 'id', cid)
     stats['stacks_restored'] += 1
     return True
 
@@ -1646,11 +1733,7 @@ def restore_stacks_parallel(tgt, src, stats):
     return changed
 
 
-def fix_inventories(target, sources, dry_run):
-    """Generic count/contents restore across all matched block entities."""
-    print("--- fix_inventories (generic mod-inventory sweep) ---")
-    stats = Counter()
-
+def make_inventories_visitor(sources, stats):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -1670,7 +1753,14 @@ def fix_inventories(target, sources, dry_run):
                 changed = True
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def fix_inventories(target, sources, dry_run):
+    """Generic count/contents restore across all matched block entities."""
+    print("--- fix_inventories (generic mod-inventory sweep) ---")
+    stats = Counter()
+    walk_region(target, 'region', make_inventories_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
     if UNMAPPED_TAG_KEYS:
@@ -1682,11 +1772,7 @@ def fix_inventories(target, sources, dry_run):
 # ============================================================================
 # Structural fixers (wiped/reshaped payloads restored from 1.20 source)
 # ============================================================================
-def _be_fixer(target, sources, dry_run, mc_id, per_be):
-    """Shared scaffold: walk region BEs of mc_id, match source by (x,y,z),
-    call per_be(target_be, source_be, stats)->bool(changed)."""
-    stats = Counter()
-
+def make_be_fixer_visitor(sources, stats, mc_id, per_be):
     def visit(chunk):
         bes = cget(chunk, 'block_entities')
         if bes is None:
@@ -1708,37 +1794,44 @@ def _be_fixer(target, sources, dry_run, mc_id, per_be):
                 changed = True
         return changed
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
+
+
+def _be_fixer(target, sources, dry_run, mc_id, per_be):
+    """Shared scaffold: walk region BEs of mc_id, match source by (x,y,z),
+    call per_be(target_be, source_be, stats)->bool(changed)."""
+    stats = Counter()
+    walk_region(target, 'region', make_be_fixer_visitor(sources, stats, mc_id, per_be), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
 
+def _per_be_fluid_tank(be, src, stats):
+    src_tc = cget(src, 'TankContent')
+    if src_tc is None:
+        return False
+    amt = cget(src_tc, 'Amount')
+    fname = cget(src_tc, 'FluidName')
+    if amt is None or fname is None or int(amt.value) <= 0:
+        return False
+    tgt_tc = cget(be, 'TankContent')
+    if tgt_tc is None:
+        tgt_tc = make_compound()
+        cset(be, 'TankContent', tgt_tc)
+    if cget(tgt_tc, 'Fluid') is not None:
+        stats['already_fixed'] += 1
+        return False
+    fluid = make_compound(name='Fluid')
+    cset(fluid, 'amount', make_int(amt.value))
+    cset(fluid, 'id', make_string(fname.value))
+    cset(tgt_tc, 'Fluid', fluid)
+    stats['fixed'] += 1
+    return True
+
+
 def fix_fluid_tanks(target, sources, dry_run):
     print("--- fix_fluid_tanks ---")
-
-    def per_be(be, src, stats):
-        src_tc = cget(src, 'TankContent')
-        if src_tc is None:
-            return False
-        amt = cget(src_tc, 'Amount')
-        fname = cget(src_tc, 'FluidName')
-        if amt is None or fname is None or int(amt.value) <= 0:
-            return False
-        tgt_tc = cget(be, 'TankContent')
-        if tgt_tc is None:
-            tgt_tc = make_compound()
-            cset(be, 'TankContent', tgt_tc)
-        if cget(tgt_tc, 'Fluid') is not None:
-            stats['already_fixed'] += 1
-            return False
-        fluid = make_compound(name='Fluid')
-        cset(fluid, 'amount', make_int(amt.value))
-        cset(fluid, 'id', make_string(fname.value))
-        cset(tgt_tc, 'Fluid', fluid)
-        stats['fixed'] += 1
-        return True
-
-    _be_fixer(target, sources, dry_run, 'create:fluid_tank', per_be)
+    _be_fixer(target, sources, dry_run, 'create:fluid_tank', _per_be_fluid_tank)
 
 
 _PANEL_SLOTS = ('top_left', 'top_right', 'bottom_left', 'bottom_right')
@@ -1750,121 +1843,117 @@ def _xyzslot(e):
             cget(e, 'Slot').value if cget(e, 'Slot') is not None else 0)
 
 
+def _per_be_factory_panel(be, src, stats):
+    changed = False
+    for sn in _PANEL_SLOTS:
+        s_slot = cget(src, sn)
+        t_slot = cget(be, sn)
+        if s_slot is None or t_slot is None:
+            continue
+        # Targeting: {X,Y,Z,Slot} -> {pos:[x,y,z], slot:<name>}
+        s_t = cget(s_slot, 'Targeting')
+        t_t = cget(t_slot, 'Targeting')
+        if s_t is not None and len(s_t.tags) > 0 and (t_t is None or len(t_t.tags) == 0):
+            nl = make_list(TAG_Compound, name='Targeting')
+            for e in s_t.tags:
+                x, y, z, sl = _xyzslot(e)
+                ne = make_compound()
+                cset(ne, 'pos', make_ia([x, y, z]))
+                cset(ne, 'slot', make_string(_PANEL_SLOT_NAME.get(sl, 'bottom_left')))
+                nl.tags.append(ne)
+            cset(t_slot, 'Targeting', nl)
+            stats['targeting_fixed'] += 1
+            changed = True
+        # TargetedBy: {X,Y,Z,Slot,Amount,ArrowBending} -> {amount,arrow_bending,position{pos,slot}}
+        s_tb = cget(s_slot, 'TargetedBy')
+        t_tb = cget(t_slot, 'TargetedBy')
+        if s_tb is not None and len(s_tb.tags) > 0 and (t_tb is None or len(t_tb.tags) == 0):
+            nl = make_list(TAG_Compound, name='TargetedBy')
+            for e in s_tb.tags:
+                x, y, z, sl = _xyzslot(e)
+                amount = cget(e, 'Amount')
+                bending = cget(e, 'ArrowBending')
+                ne = make_compound()
+                cset(ne, 'amount', make_int(amount.value if amount is not None else 0))
+                cset(ne, 'arrow_bending', make_int(bending.value if bending is not None else -1))
+                pos = make_compound(name='position')
+                cset(pos, 'pos', make_ia([x, y, z]))
+                cset(pos, 'slot', make_string(_PANEL_SLOT_NAME.get(sl, 'bottom_left')))
+                cset(ne, 'position', pos)
+                nl.tags.append(ne)
+            cset(t_slot, 'TargetedBy', nl)
+            stats['targetedby_fixed'] += 1
+            changed = True
+    return changed
+
+
 def fix_factory_panels(target, sources, dry_run):
     print("--- fix_factory_panels ---")
+    _be_fixer(target, sources, dry_run, 'create:factory_panel', _per_be_factory_panel)
 
-    def per_be(be, src, stats):
-        changed = False
-        for sn in _PANEL_SLOTS:
-            s_slot = cget(src, sn)
-            t_slot = cget(be, sn)
-            if s_slot is None or t_slot is None:
-                continue
-            # Targeting: {X,Y,Z,Slot} -> {pos:[x,y,z], slot:<name>}
-            s_t = cget(s_slot, 'Targeting')
-            t_t = cget(t_slot, 'Targeting')
-            if s_t is not None and len(s_t.tags) > 0 and (t_t is None or len(t_t.tags) == 0):
-                nl = make_list(TAG_Compound, name='Targeting')
-                for e in s_t.tags:
-                    x, y, z, sl = _xyzslot(e)
-                    ne = make_compound()
-                    cset(ne, 'pos', make_ia([x, y, z]))
-                    cset(ne, 'slot', make_string(_PANEL_SLOT_NAME.get(sl, 'bottom_left')))
-                    nl.tags.append(ne)
-                cset(t_slot, 'Targeting', nl)
-                stats['targeting_fixed'] += 1
-                changed = True
-            # TargetedBy: {X,Y,Z,Slot,Amount,ArrowBending} -> {amount,arrow_bending,position{pos,slot}}
-            s_tb = cget(s_slot, 'TargetedBy')
-            t_tb = cget(t_slot, 'TargetedBy')
-            if s_tb is not None and len(s_tb.tags) > 0 and (t_tb is None or len(t_tb.tags) == 0):
-                nl = make_list(TAG_Compound, name='TargetedBy')
-                for e in s_tb.tags:
-                    x, y, z, sl = _xyzslot(e)
-                    amount = cget(e, 'Amount')
-                    bending = cget(e, 'ArrowBending')
-                    ne = make_compound()
-                    cset(ne, 'amount', make_int(amount.value if amount is not None else 0))
-                    cset(ne, 'arrow_bending', make_int(bending.value if bending is not None else -1))
-                    pos = make_compound(name='position')
-                    cset(pos, 'pos', make_ia([x, y, z]))
-                    cset(pos, 'slot', make_string(_PANEL_SLOT_NAME.get(sl, 'bottom_left')))
-                    cset(ne, 'position', pos)
-                    nl.tags.append(ne)
-                cset(t_slot, 'TargetedBy', nl)
-                stats['targetedby_fixed'] += 1
-                changed = True
-        return changed
 
-    _be_fixer(target, sources, dry_run, 'create:factory_panel', per_be)
+def _per_be_table_cloth(be, src, stats):
+    src_req = cget(src, 'EncodedRequest')
+    src_valid = cget(src, 'Valid')
+    # Only the shop cloths carry a real request / valid flag.
+    if src_valid is None or int(src_valid.value) == 0:
+        return False
+    rd = cget(be, 'RequestData')
+    if rd is not None:
+        iv = cget(rd, 'is_valid')
+        if iv is not None and int(iv.value) == 1:
+            stats['already_fixed'] += 1
+            return False
+    rd = make_compound(name='RequestData')
+    dim = cget(src, 'TargetDim')
+    cset(rd, 'target_dim', make_string(dim.value if dim and dim.value else 'null'))
+    off = cget(src, 'TargetOffset')
+    if off is not None:
+        cset(rd, 'target_offset', xyz_compound_to_ia(off))
+    else:
+        cset(rd, 'target_offset', make_ia([0, 0, 0]))
+    enc = make_compound(name='encoded_request')
+    cset(enc, 'ordered_crafts', make_list(TAG_Compound, name='ordered_crafts'))
+    cset(enc, 'ordered_stacks',
+         _ordered_stacks(cget(src_req, 'OrderedStacks') if src_req is not None else None))
+    cset(rd, 'encoded_request', enc)
+    addr = cget(src, 'EncodedAddress')
+    cset(rd, 'encoded_target_address', make_string(addr.value if addr is not None else ''))
+    cset(rd, 'is_valid', make_byte(1))
+    cset(be, 'RequestData', rd)
+    stats['fixed'] += 1
+    return True
 
 
 def fix_table_cloths(target, sources, dry_run):
     print("--- fix_table_cloths (shops) ---")
+    _be_fixer(target, sources, dry_run, 'create:table_cloth', _per_be_table_cloth)
 
-    def per_be(be, src, stats):
-        src_req = cget(src, 'EncodedRequest')
-        src_valid = cget(src, 'Valid')
-        # Only the shop cloths carry a real request / valid flag.
-        if src_valid is None or int(src_valid.value) == 0:
-            return False
-        rd = cget(be, 'RequestData')
-        if rd is not None:
-            iv = cget(rd, 'is_valid')
-            if iv is not None and int(iv.value) == 1:
-                stats['already_fixed'] += 1
-                return False
-        rd = make_compound(name='RequestData')
-        dim = cget(src, 'TargetDim')
-        cset(rd, 'target_dim', make_string(dim.value if dim and dim.value else 'null'))
-        off = cget(src, 'TargetOffset')
-        if off is not None:
-            cset(rd, 'target_offset', xyz_compound_to_ia(off))
-        else:
-            cset(rd, 'target_offset', make_ia([0, 0, 0]))
-        enc = make_compound(name='encoded_request')
-        cset(enc, 'ordered_crafts', make_list(TAG_Compound, name='ordered_crafts'))
-        cset(enc, 'ordered_stacks',
-             _ordered_stacks(cget(src_req, 'OrderedStacks') if src_req is not None else None))
-        cset(rd, 'encoded_request', enc)
-        addr = cget(src, 'EncodedAddress')
-        cset(rd, 'encoded_target_address', make_string(addr.value if addr is not None else ''))
-        cset(rd, 'is_valid', make_byte(1))
-        cset(be, 'RequestData', rd)
-        stats['fixed'] += 1
-        return True
 
-    _be_fixer(target, sources, dry_run, 'create:table_cloth', per_be)
+def _per_be_clipboard(be, src, stats):
+    src_item = cget(src, 'Item')
+    src_tag = cget(src_item, 'tag') if src_item is not None else None
+    if src_tag is None:
+        stats['no_source_tag'] += 1
+        return False
+    components = cget(be, 'components')
+    if components is None:
+        components = make_compound()
+        cset(be, 'components', components)
+    if cget(components, 'create:clipboard_content') is not None:
+        stats['already_fixed'] += 1
+        return False
+    cset(components, 'create:clipboard_content', build_clipboard_content(src_tag))
+    stats['fixed'] += 1
+    return True
 
 
 def fix_clipboards(target, sources, dry_run):
     print("--- fix_clipboards ---")
-
-    def per_be(be, src, stats):
-        src_item = cget(src, 'Item')
-        src_tag = cget(src_item, 'tag') if src_item is not None else None
-        if src_tag is None:
-            stats['no_source_tag'] += 1
-            return False
-        components = cget(be, 'components')
-        if components is None:
-            components = make_compound()
-            cset(be, 'components', components)
-        if cget(components, 'create:clipboard_content') is not None:
-            stats['already_fixed'] += 1
-            return False
-        cset(components, 'create:clipboard_content', build_clipboard_content(src_tag))
-        stats['fixed'] += 1
-        return True
-
-    _be_fixer(target, sources, dry_run, 'create:clipboard', per_be)
+    _be_fixer(target, sources, dry_run, 'create:clipboard', _per_be_clipboard)
 
 
-def fix_package_entities(target, sources, dry_run):
-    """Restore loose create:package entities whose Box item lost its contents."""
-    print("--- fix_package_entities ---")
-    stats = Counter()
-
+def make_package_entities_visitor(sources, stats):
     def visit(chunk):
         ents = cget(chunk, 'Entities')
         if ents is None:
@@ -1893,7 +1982,14 @@ def fix_package_entities(target, sources, dry_run):
             changed = True
         return changed
 
-    walk_region(target, 'entities', visit, dry_run)
+    return visit
+
+
+def fix_package_entities(target, sources, dry_run):
+    """Restore loose create:package entities whose Box item lost its contents."""
+    print("--- fix_package_entities ---")
+    stats = Counter()
+    walk_region(target, 'entities', make_package_entities_visitor(sources, stats), dry_run)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -1901,30 +1997,30 @@ def fix_package_entities(target, sources, dry_run):
 _POSTBOX_TARGET_TYPE = {'TrainStation': 'create:train_station'}
 
 
+def _per_be_postbox(be, src, stats):
+    src_t = cget(src, 'Target')
+    if src_t is None:
+        return False
+    tgt_t = cget(be, 'Target')
+    if tgt_t is not None and cget(tgt_t, 'type') is not None:
+        stats['already_fixed'] += 1
+        return False
+    typ = cget(src_t, 'Type')
+    rel = cget(src_t, 'RelativePos')
+    nt = make_compound(name='Target')
+    if typ is not None:
+        cset(nt, 'type', make_string(_POSTBOX_TARGET_TYPE.get(typ.value, typ.value)))
+    if rel is not None:
+        cset(nt, 'relative_pos', xyz_compound_to_ia(rel))
+    cset(be, 'Target', nt)
+    stats['fixed'] += 1
+    return True
+
+
 def fix_postboxes(target, sources, dry_run):
     """Restore the postbox Target (linked station) lost on migration."""
     print("--- fix_postboxes ---")
-
-    def per_be(be, src, stats):
-        src_t = cget(src, 'Target')
-        if src_t is None:
-            return False
-        tgt_t = cget(be, 'Target')
-        if tgt_t is not None and cget(tgt_t, 'type') is not None:
-            stats['already_fixed'] += 1
-            return False
-        typ = cget(src_t, 'Type')
-        rel = cget(src_t, 'RelativePos')
-        nt = make_compound(name='Target')
-        if typ is not None:
-            cset(nt, 'type', make_string(_POSTBOX_TARGET_TYPE.get(typ.value, typ.value)))
-        if rel is not None:
-            cset(nt, 'relative_pos', xyz_compound_to_ia(rel))
-        cset(be, 'Target', nt)
-        stats['fixed'] += 1
-        return True
-
-    _be_fixer(target, sources, dry_run, 'create:package_postbox', per_be)
+    _be_fixer(target, sources, dry_run, 'create:package_postbox', _per_be_postbox)
 
 
 # ============================================================================
@@ -1963,12 +2059,9 @@ def reconstruct_from_custom_data(item, stats):
     return True
 
 
-def fix_mod_items(target, sources, dry_run):
-    """Rebuild mod-item components from custom_data in playerdata + region."""
-    print("--- fix_mod_items (custom_data -> components) ---")
-    stats = Counter()
-
-    # region (vanilla containers: chests, barrels carry mod items)
+def make_mod_items_visitor(sources, stats):
+    """Region visitor: rebuild mod-item components from custom_data in
+    vanilla containers (chests/barrels carrying mod items). sources unused."""
     def visit(chunk):
         changed = [False]
 
@@ -1981,9 +2074,13 @@ def fix_mod_items(target, sources, dry_run):
             walk_items(bes, on_item)
         return changed[0]
 
-    walk_region(target, 'region', visit, dry_run)
+    return visit
 
-    # playerdata
+
+def fix_mod_items_playerdata(target, dry_run, stats=None):
+    """Global: rebuild mod-item components from custom_data in playerdata."""
+    if stats is None:
+        stats = Counter()
     pd = Path(target) / 'playerdata'
     if pd.exists():
         for f in sorted(pd.glob('*.dat')):
@@ -2003,7 +2100,15 @@ def fix_mod_items(target, sources, dry_run):
                 print(f"  {f.name}: {'rewriting' if not dry_run else 'WOULD rewrite'}")
                 if not dry_run:
                     n.write_file(str(f))
+    return stats
 
+
+def fix_mod_items(target, sources, dry_run):
+    """Rebuild mod-item components from custom_data in region + playerdata."""
+    print("--- fix_mod_items (custom_data -> components) ---")
+    stats = Counter()
+    walk_region(target, 'region', make_mod_items_visitor(sources, stats), dry_run)
+    fix_mod_items_playerdata(target, dry_run, stats)
     for k, v in sorted(stats.items()):
         print(f"  {k}: {v}")
 
@@ -2240,6 +2345,366 @@ def index_source(sources):
 
 
 # ============================================================================
+# Parallel, single-pass, resumable migration (region workers + global pass)
+# ============================================================================
+# (subdir, label). Overworld subdir is '' -> Path(world)/'' == Path(world).
+DIMENSIONS = [('', 'overworld'), ('DIM-1', 'nether'), ('DIM1', 'end')]
+_DIM_LABEL = {sub: lbl for sub, lbl in DIMENSIONS}
+_DIM_SUBDIR = {lbl: sub for sub, lbl in DIMENSIONS}
+_DIM_SUBDIR['DIM-1'] = 'DIM-1'
+_DIM_SUBDIR['DIM1'] = 'DIM1'
+
+
+def _dim_base(world, dim_subdir):
+    return Path(world) / dim_subdir if dim_subdir else Path(world)
+
+
+def _rkey(dim_subdir, rx, rz):
+    return f"{_DIM_LABEL.get(dim_subdir, dim_subdir or 'overworld')}.{rx}.{rz}"
+
+
+class RegionSources:
+    """Source index scoped to a single region: block entities by (id,x,y,z) and
+    static entities by UUID, loaded only from that region's source files."""
+
+    def __init__(self, source_world, dim_subdir, rx, rz):
+        self.be_by_xyz = {}
+        self.ent_by_uuid = {}
+        base = _dim_base(source_world, dim_subdir)
+        self._index(base / 'region' / f'r.{rx}.{rz}.mca', 'block_entities', self._add_be)
+        self._index(base / 'entities' / f'r.{rx}.{rz}.mca', 'Entities', self._add_ent)
+
+    def _index(self, path, list_key, add):
+        if not path.exists():
+            return
+        try:
+            rf = region.RegionFile(str(path))
+        except Exception:
+            return
+        for entry in rf.get_chunk_coords():
+            try:
+                chunk = rf.get_chunk(entry['x'], entry['z'])
+            except Exception:
+                continue
+            if chunk is None:
+                continue
+            lst = cget(chunk, list_key)
+            if lst is None:
+                continue
+            for item in lst.tags:
+                add(item)
+
+    def _add_be(self, be):
+        tid, x, y, z = cget(be, 'id'), cget(be, 'x'), cget(be, 'y'), cget(be, 'z')
+        if tid and x and y and z:
+            self.be_by_xyz[(tid.value, x.value, y.value, z.value)] = be
+
+    def _add_ent(self, ent):
+        u = cget(ent, 'UUID')
+        if u:
+            self.ent_by_uuid[tuple(u.value)] = ent
+
+    def be(self, mc_id, x, y, z):
+        return self.be_by_xyz.get((mc_id, x, y, z))
+
+    def entity_by_uuid(self, uuid):
+        return self.ent_by_uuid.get(tuple(uuid))
+
+
+def _process_region_file(region_path, visitors, dry_run):
+    """Single-pass over one region file: read each chunk once, run every visitor,
+    write changed chunks once. Atomic on write (patch a temp copy, os.replace)."""
+    region_path = Path(region_path)
+    if not region_path.exists() or not visitors:
+        return (0, 0)
+    work = region_path
+    if not dry_run:
+        work = region_path.with_suffix('.mca.tmp')
+        shutil.copy2(region_path, work)
+    rf = region.RegionFile(str(work))
+    n_chunks = n_mod = 0
+    try:
+        for entry in rf.get_chunk_coords():
+            try:
+                chunk = rf.get_chunk(entry['x'], entry['z'])
+            except Exception:
+                continue
+            if chunk is None:
+                continue
+            n_chunks += 1
+            dirty = False
+            for v in visitors:
+                if v(chunk):
+                    dirty = True
+            if dirty:
+                n_mod += 1
+                if not dry_run:
+                    rf.write_chunk(entry['x'], entry['z'], chunk)
+    finally:
+        try:
+            rf.close()
+        except Exception:
+            try:
+                rf.file.close()
+            except Exception:
+                pass
+    if not dry_run:
+        _atomic_replace(str(work), str(region_path))
+    return (n_chunks, n_mod)
+
+
+def migrate_region(dim_subdir, rx, rz, source_world, target_world, dry_run=False):
+    """Process one region (region/ + entities/) self-contained. Picklable worker.
+    Returns a dict with stats and the backpack (S,O) pairs / claimed UUIDs that the
+    global .dat pass needs."""
+    UNMAPPED_TAG_KEYS.clear()  # per-region audit of item-NBT keys routed to custom_data
+    src = RegionSources(source_world, dim_subdir, rx, rz)
+    stats = Counter()
+    pairs, claimed = [], []
+    region_visitors = [
+        make_chain_conveyors_visitor(src, stats),
+        make_tracks_visitor(src, stats),
+        make_track_signals_visitor(src, stats),
+        make_be_fixer_visitor(src, stats, 'create:fluid_tank', _per_be_fluid_tank),
+        make_be_fixer_visitor(src, stats, 'create:factory_panel', _per_be_factory_panel),
+        make_be_fixer_visitor(src, stats, 'create:table_cloth', _per_be_table_cloth),
+        make_be_fixer_visitor(src, stats, 'create:clipboard', _per_be_clipboard),
+        make_be_fixer_visitor(src, stats, 'create:package_postbox', _per_be_postbox),
+        make_inventories_visitor(src, stats),
+        make_be_backpacks_visitor(src, stats),
+        make_mod_items_visitor(src, stats),
+        make_backpack_collect_visitor(stats, pairs, claimed),
+    ]
+    entity_visitors = [
+        make_paintings_visitor(src, stats),
+        make_item_frames_visitor(src, stats),
+        make_package_entities_visitor(src, stats),
+    ]
+    base = _dim_base(target_world, dim_subdir)
+    rc, rm = _process_region_file(base / 'region' / f'r.{rx}.{rz}.mca', region_visitors, dry_run)
+    ec, em = _process_region_file(base / 'entities' / f'r.{rx}.{rz}.mca', entity_visitors, dry_run)
+    stats['region_chunks'], stats['region_modified'] = rc, rm
+    stats['entity_chunks'], stats['entity_modified'] = ec, em
+    return {'dim': dim_subdir, 'rx': rx, 'rz': rz, 'stats': dict(stats),
+            'backpack_pairs': pairs, 'backpack_claimed': claimed,
+            'unmapped': dict(UNMAPPED_TAG_KEYS)}
+
+
+def _migrate_region_worker(args):
+    """ProcessPool entry point. Catches errors so one bad region can't kill the run."""
+    dim_subdir, rx, rz, source_world, target_world, dry_run = args
+    try:
+        res = migrate_region(dim_subdir, rx, rz, source_world, target_world, dry_run)
+        res['ok'] = True
+        return res
+    except Exception:
+        return {'dim': dim_subdir, 'rx': rx, 'rz': rz, 'ok': False,
+                'error': traceback.format_exc(), 'stats': {}, 'backpack_pairs': [], 'backpack_claimed': []}
+
+
+# --- global pass (.dat + playerdata; the only non-region state) -------------
+def _global_backpacks(source_world, target_world, region_pairs, region_claimed, dry_run):
+    datpath = Path(target_world) / 'data' / 'sophisticatedbackpacks.dat'
+    if not datpath.exists():
+        print("  (no sophisticatedbackpacks.dat)")
+        return
+    dat = nbt_mod.NBTFile(str(datpath))
+    bc = _path(dat, 'data', 'backpackContents')
+    if bc is None:
+        return
+    idx = {tuple(cget(e, 'uuid').value): e for e in bc.tags if cget(e, 'uuid') is not None}
+    stats = Counter()
+    claimed = set(tuple(c) for c in region_claimed)
+    dat_changed = [False]
+
+    # 1. rehome contents for backpack items found across all regions
+    for S, O in region_pairs:
+        claimed.add(tuple(S))
+        if _bp_rehome(idx, bc, S, O, stats):
+            dat_changed[0] = True
+
+    # 2. playerdata backpacks (inventory/ender) + worn restore
+    src_pd = {}
+    spd = Path(source_world) / 'playerdata'
+    if spd.exists():
+        for f in spd.glob('*.dat'):
+            try:
+                src_pd[f.name] = nbt_mod.NBTFile(str(f))
+            except Exception:
+                pass
+    pd = Path(target_world) / 'playerdata'
+    if pd.exists():
+        for f in sorted(pd.glob('*.dat')):
+            try:
+                n = nbt_mod.NBTFile(str(f))
+            except Exception as e:
+                print(f"  !! open {f.name}: {e}")
+                continue
+            fc = [False]
+
+            def on_item(it):
+                idt = cget(it, 'id')
+                if idt is not None and isinstance(idt.value, str) and is_backpack(idt.value):
+                    if _bp_handle_present(it, idx, bc, claimed, stats):
+                        dat_changed[0] = True
+                        fc[0] = True
+
+            walk_items(n, on_item)
+            src_nbt = src_pd.get(f.name)
+            if src_nbt is not None and _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
+                fc[0] = True
+                dat_changed[0] = True
+            if fc[0]:
+                print(f"  {f.name}: {'rewriting' if not dry_run else 'WOULD rewrite'}")
+                if not dry_run:
+                    n.write_file(str(f))
+
+    if dat_changed[0]:
+        print(f"  sophisticatedbackpacks.dat: {'rewriting' if not dry_run else 'WOULD rewrite'}")
+        if not dry_run:
+            dat.write_file(str(datpath))
+    for k, v in sorted(stats.items()):
+        print(f"  {k}: {v}")
+
+
+def migrate_global(source_world, target_world, region_pairs, region_claimed, dry_run=False):
+    """The only serial / world-global work: sophisticatedbackpacks.dat and playerdata."""
+    print("--- migrate_global (.dat + playerdata) ---")
+    fix_backpack_dat(target_world, dry_run)
+    _global_backpacks(source_world, target_world, region_pairs, region_claimed, dry_run)
+    stats = fix_mod_items_playerdata(target_world, dry_run)
+    for k, v in sorted(stats.items()):
+        print(f"  mod_items {k}: {v}")
+
+
+# --- region discovery + manifest --------------------------------------------
+_RE_REGION = re.compile(r'^r\.(-?\d+)\.(-?\d+)\.mca$')
+
+
+def discover_regions(target_world, only=None):
+    regions = []
+    for dim_subdir, _lbl in DIMENSIONS:
+        rdir = _dim_base(target_world, dim_subdir) / 'region'
+        if not rdir.exists():
+            continue
+        for f in sorted(rdir.glob('r.*.mca')):
+            m = _RE_REGION.match(f.name)
+            if m:
+                regions.append((dim_subdir, int(m.group(1)), int(m.group(2))))
+    if only:
+        only = set(only)
+        regions = [r for r in regions if _rkey(*r) in only]
+    return regions
+
+
+def _atomic_replace(tmp, dst, attempts=20, delay=0.1):
+    """os.replace, retrying transient Windows locks (Defender/indexer)."""
+    for i in range(attempts):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
+def _manifest_path(target_world):
+    return Path(target_world) / 'migration_manifest.json'
+
+
+def load_manifest(target_world):
+    p = _manifest_path(target_world)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {'regions': {}, 'global': {}}
+
+
+def save_manifest(target_world, manifest):
+    p = _manifest_path(target_world)
+    tmp = p.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(manifest, indent=1))
+    _atomic_replace(tmp, p)
+
+
+def run_parallel(source_world, target_world, jobs=20, force=False, only=None,
+                 dry_run=False, do_global=True):
+    regions = discover_regions(target_world, only)
+    manifest = load_manifest(target_world)
+    todo = [r for r in regions
+            if force or manifest['regions'].get(_rkey(*r), {}).get('status') != 'done']
+    print(f"=== run: {len(regions)} region(s), {len(todo)} to process, "
+          f"{len(regions) - len(todo)} already done, jobs={jobs}, "
+          f"{'DRY-RUN' if dry_run else 'WRITE'} ===")
+
+    t0 = time.time()
+    tasks = [(dim, rx, rz, source_world, target_world, dry_run) for (dim, rx, rz) in todo]
+    done = 0
+    if jobs > 1 and len(tasks) > 1:
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            for res in ex.map(_migrate_region_worker, tasks):
+                done += 1
+                _record_region(manifest, target_world, res, dry_run, done, len(tasks))
+    else:
+        for t in tasks:
+            res = _migrate_region_worker(t)
+            done += 1
+            _record_region(manifest, target_world, res, dry_run, done, len(tasks))
+
+    print(f"=== region pass: {done} processed in {time.time() - t0:.1f}s ===")
+
+    if do_global:
+        all_pairs, all_claimed = [], []
+        for info in manifest['regions'].values():
+            if info.get('status') == 'done':
+                all_pairs += info.get('backpack_pairs', [])
+                all_claimed += info.get('backpack_claimed', [])
+        migrate_global(source_world, target_world, all_pairs, all_claimed, dry_run)
+        manifest['global'] = {'status': 'done', 'finished_at': time.time()}
+        if not dry_run:
+            save_manifest(target_world, manifest)
+
+    # Aggregate the item-NBT audit across all regions (keys routed to custom_data)
+    unmapped = Counter()
+    for info in manifest['regions'].values():
+        for k, v in (info.get('unmapped') or {}).items():
+            unmapped[k] += v
+    if unmapped:
+        print("=== item-NBT keys routed to custom_data (review before trusting) ===")
+        for k, v in unmapped.most_common():
+            print(f"  {k}: {v}")
+    print(f"=== run complete in {time.time() - t0:.1f}s ===")
+
+
+def _record_region(manifest, target_world, res, dry_run, done, total):
+    key = _rkey(res['dim'], res['rx'], res['rz'])
+    if not res.get('ok'):
+        print(f"  [FAIL {done}/{total}] {key}\n{res.get('error', '')}")
+        manifest['regions'][key] = {'status': 'failed', 'error': res.get('error', '')[-500:]}
+    else:
+        st = res['stats']
+        manifest['regions'][key] = {
+            'status': 'done', 'stats': st, 'finished_at': time.time(),
+            'backpack_pairs': res['backpack_pairs'], 'backpack_claimed': res['backpack_claimed'],
+            'unmapped': res.get('unmapped', {}),
+        }
+        mod = st.get('region_modified', 0) + st.get('entity_modified', 0)
+        if mod:
+            print(f"  [done {done}/{total}] {key}  chunks={st.get('region_chunks', 0)} modified={mod}")
+    if not dry_run:
+        save_manifest(target_world, manifest)
+
+
+def parse_coord(s):
+    """'overworld.3.3' / 'DIM-1.0.-1' -> (dim_subdir, rx, rz)."""
+    dim, rx, rz = s.rsplit('.', 2)
+    return (_DIM_SUBDIR.get(dim, dim if dim != 'overworld' else ''), int(rx), int(rz))
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 SUBCOMMANDS = (
@@ -2249,6 +2714,7 @@ SUBCOMMANDS = (
     'fix-clipboards', 'fix-mod-items', 'fix-backpack-dat', 'fix-worn-curios',
     'fix-backpacks', 'fix-package-entities', 'fix-postboxes',
     'fix-all', 'verify',
+    'region', 'run', 'global',
 )
 
 
@@ -2259,12 +2725,47 @@ def main():
     ap.add_argument('--target', required=True, help='1.21 target world dir to patch')
     ap.add_argument('--ref', help='1.21 reference world (for verify)')
     ap.add_argument('--write', action='store_true', help='Actually write changes (default: dry-run)')
+    ap.add_argument('--coord', help="region subcommand: <dim>.<rx>.<rz>, e.g. overworld.3.3")
+    ap.add_argument('--jobs', type=int, default=20, help="run: parallel worker processes (default 20)")
+    ap.add_argument('--only', nargs='*', help="run: only these region keys (targeted rerun)")
+    ap.add_argument('--force', action='store_true', help="run: reprocess regions even if manifest says done")
+    ap.add_argument('--no-global', action='store_true', help="run: skip the .dat/playerdata global pass")
     args = ap.parse_args()
 
     if args.subcommand == 'verify':
         if not args.ref:
             ap.error('verify requires --ref <1.21-target world>')
         verify(args.target, args.ref, args.source)
+        return
+
+    # Parallel / per-region commands (use region-scoped source loading, not whole-world).
+    if args.subcommand in ('region', 'run', 'global'):
+        if not args.source:
+            ap.error('this subcommand requires --source')
+        dry = not args.write
+        if dry:
+            print("*** DRY RUN — pass --write to actually modify the target world ***\n")
+        if args.subcommand == 'region':
+            if not args.coord:
+                ap.error('region requires --coord <dim>.<rx>.<rz>')
+            dim, rx, rz = parse_coord(args.coord)
+            res = migrate_region(dim, rx, rz, args.source, args.target, dry)
+            print(f"--- region {_rkey(dim, rx, rz)} ---")
+            for k, v in sorted(res['stats'].items()):
+                if v:
+                    print(f"  {k}: {v}")
+            print(f"  backpack_pairs collected: {len(res['backpack_pairs'])}")
+        elif args.subcommand == 'global':
+            mani = load_manifest(args.target)
+            pairs, claimed = [], []
+            for info in mani['regions'].values():
+                if info.get('status') == 'done':
+                    pairs += info.get('backpack_pairs', [])
+                    claimed += info.get('backpack_claimed', [])
+            migrate_global(args.source, args.target, pairs, claimed, dry)
+        else:  # run
+            run_parallel(args.source, args.target, jobs=args.jobs, force=args.force,
+                         only=args.only, dry_run=dry, do_global=not args.no_global)
         return
 
     dry = not args.write
