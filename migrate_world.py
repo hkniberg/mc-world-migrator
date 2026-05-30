@@ -2636,9 +2636,14 @@ def run_parallel(source_world, target_world, jobs=20, force=False, only=None,
     manifest = load_manifest(target_world)
     todo = [r for r in regions
             if force or manifest['regions'].get(_rkey(*r), {}).get('status') != 'done']
-    print(f"=== run: {len(regions)} region(s), {len(todo)} to process, "
-          f"{len(regions) - len(todo)} already done, jobs={jobs}, "
-          f"{'DRY-RUN' if dry_run else 'WRITE'} ===")
+    by_dim = Counter(_DIM_LABEL.get(d, d or 'overworld') for d, _rx, _rz in regions)
+    print(f"=== run: {len(regions)} region(s) "
+          f"[{', '.join(f'{k}: {v}' for k, v in by_dim.items()) or 'none found'}], "
+          f"{len(todo)} to process, {len(regions) - len(todo)} already done, "
+          f"jobs={jobs}, {'DRY-RUN' if dry_run else 'WRITE'} ===")
+    if not regions:
+        print("  !! no region files discovered under region/, DIM-1/region/, DIM1/region/ "
+              "— check the world path / dimension layout")
 
     t0 = time.time()
     tasks = [(dim, rx, rz, source_world, target_world, dry_run) for (dim, rx, rz) in todo]
