@@ -839,14 +839,25 @@ def _bp_rehome(idx, bc, S, O, stats):
 
 
 def _bp_handle_present(item, idx, bc, claimed, stats):
-    """A backpack item already has SB's assigned storage_uuid (S) and the old
-    contentsUuid (O) in custom_data; rehome .dat[O] -> .dat[S], clean residue."""
+    """Repair a backpack item in place.
+
+    Two states occur in a force-upgraded world:
+      A) SB assigned a fresh storage_uuid (S) during migration and left the old
+         contentsUuid (O) in custom_data -> rehome .dat[O] -> .dat[S].
+      B) the item has NO storage_uuid, only custom_data (contentsUuid + slots)
+         -> promote it: storage_uuid := contentsUuid, whose .dat entry still
+         holds the (converted) contents, so no rehome is needed.
+    Either way the custom_data residue is cleaned afterwards."""
     comps = cget(item, 'components')
     if comps is None:
         return False
+    promoted = False
+    if cget(comps, 'sophisticatedcore:storage_uuid') is None:
+        # State B: lift custom_data up to real components first.
+        promoted = promote_custom_data(item)
     S = cget(comps, 'sophisticatedcore:storage_uuid')
     if S is None:
-        return False
+        return promoted
     claimed.add(tuple(S.value))
     cd = cget(comps, 'minecraft:custom_data')
     O = cget(cd, 'contentsUuid') if cd is not None else None
@@ -855,12 +866,17 @@ def _bp_handle_present(item, idx, bc, claimed, stats):
         if _bp_rehome(idx, bc, S.value, O.value, stats):
             changed = True
     if cd is not None:
+        removed = False
         for k in ('contentsUuid', 'inventorySlots', 'upgradeSlots', 'renderInfo'):
-            cdel(cd, k)
+            if cget(cd, k) is not None:
+                cdel(cd, k)
+                removed = True
         if len(cd.tags) == 0:
             cdel(comps, 'minecraft:custom_data')
-        changed = True
-    return changed
+            removed = True
+        if removed:
+            changed = True
+    return changed or promoted
 
 
 def _bp_pick_empty(idx, claimed):
@@ -870,6 +886,67 @@ def _bp_pick_empty(idx, claimed):
     return None
 
 
+def _free_inv_slots(n):
+    """Main-inventory slots (0-35) not currently occupied in this player .dat.
+    Armor (100-103) and offhand (-106) are excluded by construction."""
+    inv = cget(n, 'Inventory')
+    used = set()
+    if inv is not None:
+        for it in inv.tags:
+            s = cget(it, 'Slot')
+            if s is not None:
+                used.add(int(s.value))
+    return [s for s in range(36) if s not in used]
+
+
+def _inv_has_backpack_uuid(n, uuid_val):
+    """True if the player's main Inventory already holds a backpack whose
+    storage_uuid matches uuid_val. Idempotency guard for worn relocation."""
+    inv = cget(n, 'Inventory')
+    if inv is None:
+        return False
+    want = list(uuid_val)
+    for it in inv.tags:
+        iid = cget(it, 'id')
+        if iid is None or not is_backpack(iid.value):
+            continue
+        comps = cget(it, 'components')
+        su = cget(comps, 'sophisticatedcore:storage_uuid') if comps is not None else None
+        if su is not None and list(su.value) == want:
+            return True
+    return False
+
+
+def _bp_relocate_worn(n, src_item, stats):
+    """Place a worn-backpack item into a free main-inventory slot of player n
+    instead of re-equipping it. The Accessories/SB mod drops a re-equipped
+    backpack on load, but an ordinary inventory item survives and keeps its
+    contents: the converted item carries sophisticatedcore:storage_uuid =
+    the original contentsUuid, and .dat[contentsUuid] (converted by
+    fix_backpack_dat) still holds the contents -- so no rehome is needed.
+
+    Idempotent: skips if a backpack with the same storage_uuid is already in the
+    inventory. Returns True only when it actually appends the item."""
+    conv = item_no_slot(src_item)  # storage_uuid component == contentsUuid (O)
+    comps = cget(conv, 'components')
+    su = cget(comps, 'sophisticatedcore:storage_uuid') if comps is not None else None
+    if su is None:
+        return False  # not a real backpack / no storage id -> nothing to relocate
+    if _inv_has_backpack_uuid(n, su.value):
+        return False  # already relocated on a prior run
+    inv = cget(n, 'Inventory')
+    if inv is None:
+        return False
+    free = _free_inv_slots(n)
+    if not free:
+        stats['worn_backpack_no_free_slot'] += 1
+        return False
+    cset(conv, 'Slot', make_byte(free[0]))
+    inv.tags.append(conv)
+    stats['worn_backpack_relocated'] += 1
+    return True
+
+
 def _bp_collect_present(item, pairs, claimed, stats):
     """Region-only: record this backpack's (storage_uuid S, contentsUuid O) for
     the global .dat rehome, claim S, and clean the custom_data residue. Returns
@@ -877,9 +954,14 @@ def _bp_collect_present(item, pairs, claimed, stats):
     comps = cget(item, 'components')
     if comps is None:
         return False
+    promoted = False
+    if cget(comps, 'sophisticatedcore:storage_uuid') is None:
+        # State B (no storage_uuid, only custom_data): promote so storage_uuid
+        # := contentsUuid, whose .dat entry already holds the contents.
+        promoted = promote_custom_data(item)
     S = cget(comps, 'sophisticatedcore:storage_uuid')
     if S is None:
-        return False
+        return promoted
     claimed.append(list(S.value))
     cd = cget(comps, 'minecraft:custom_data')
     O = cget(cd, 'contentsUuid') if cd is not None else None
@@ -888,12 +970,17 @@ def _bp_collect_present(item, pairs, claimed, stats):
         stats['region_backpack_pairs'] += 1
     changed = False
     if cd is not None:
+        removed = False
         for k in ('contentsUuid', 'inventorySlots', 'upgradeSlots', 'renderInfo'):
-            cdel(cd, k)
+            if cget(cd, k) is not None:
+                cdel(cd, k)
+                removed = True
         if len(cd.tags) == 0:
             cdel(comps, 'minecraft:custom_data')
-        changed = True
-    return changed
+            removed = True
+        if removed:
+            changed = True
+    return changed or promoted
 
 
 def make_backpack_collect_visitor(stats, pairs, claimed):
@@ -992,27 +1079,43 @@ def fix_backpacks(target, sources, dry_run):
 
 
 def _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
+    """Recover worn items the Curios -> NeoForge-Accessories migration dropped.
+
+    Worn BACKPACKS are relocated into a free main-inventory slot (see
+    _bp_relocate_worn) rather than re-equipped, because the accessories mod
+    rejects a re-equipped backpack on load. Any OTHER worn curio is restored
+    into its matching target curios attachment slot, as before."""
     fc = cget(src_nbt, 'ForgeCaps')
     src_ci = cget(fc, 'curios:inventory') if fc is not None else None
-    if src_ci is None:
+    src_curios = cget(src_ci, 'Curios') if src_ci is not None else None
+    if src_curios is None:
         return False
-    src_curios = cget(src_ci, 'Curios')
     att = cget(n, 'neoforge:attachments')
     tgt_ci = cget(att, 'curios:inventory') if att is not None else None
-    if tgt_ci is None or src_curios is None:
-        return False
-    tgt_curios = cget(tgt_ci, 'Curios')
+    tgt_curios = cget(tgt_ci, 'Curios') if tgt_ci is not None else None
     tgt_by_id = {cget(c, 'Identifier').value: c for c in tgt_curios.tags
-                 if cget(c, 'Identifier') is not None}
+                 if cget(c, 'Identifier') is not None} if tgt_curios is not None else {}
     changed = False
     for sc in src_curios.tags:
         ident = cget(sc, 'Identifier')
-        if ident is None:
-            continue
         s_items = _path(sc, 'StacksHandler', 'Stacks', 'Items')
         if s_items is None or len(s_items.tags) == 0:
             continue
-        tc = tgt_by_id.get(ident.value)
+
+        # Backpacks -> free inventory slot; everything else -> curios slot.
+        rest = []
+        for it in s_items.tags:
+            iid = cget(it, 'id')
+            if iid is not None and is_backpack(iid.value):
+                if _bp_relocate_worn(n, it, stats):
+                    changed = True
+            else:
+                rest.append(it)
+        if not rest:
+            continue
+
+        # Restore non-backpack worn curios into the target attachment slot.
+        tc = tgt_by_id.get(ident.value) if ident is not None else None
         if tc is None:
             continue
         t_stacks = _path(tc, 'StacksHandler', 'Stacks')
@@ -1020,23 +1123,10 @@ def _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
             continue
         t_items = cget(t_stacks, 'Items')
         if t_items is not None and len(t_items.tags) > 0:
-            continue
+            continue  # already restored
         nl = make_list(TAG_Compound, name='Items')
-        for it in s_items.tags:
-            conv = convert_item_1_20_to_1_21(it)
-            if is_backpack(cget(it, 'id').value):
-                src_tag = cget(it, 'tag')
-                O = cget(src_tag, 'contentsUuid') if src_tag is not None else None
-                if O is not None:
-                    S = _bp_pick_empty(idx, claimed) or _bp_fresh_uuid()
-                    _bp_rehome(idx, bc, S, O.value, stats)
-                    claimed.add(tuple(S))
-                    comps = cget(conv, 'components')
-                    if comps is None:
-                        comps = make_compound()
-                        cset(conv, 'components', comps)
-                    cset(comps, 'sophisticatedcore:storage_uuid', make_ia(list(S)))
-            nl.tags.append(conv)
+        for it in rest:
+            nl.tags.append(convert_item_1_20_to_1_21(it))
         cset(t_stacks, 'Items', nl)
         stats['worn_restored'] += 1
         changed = True
@@ -2297,19 +2387,35 @@ def verify(workdir, ref, source=None):
         chk("backpack.dat all stacks count:Int", leftover[0] == 0,
             '' if leftover[0] == 0 else f"{leftover[0]} stacks still 1.20 Count")
 
-    # Worn curios: back slot populated
+    # Worn backpack: relocated from the curios slot into a free main-inventory
+    # slot (the accessories mod rejects a re-equipped backpack on load). Verify
+    # each source-worn backpack now appears in the target Inventory carrying
+    # storage_uuid == its original contentsUuid.
     pd = Path(workdir) / 'playerdata'
-    if pd.exists():
-        for f in sorted(pd.glob('*.dat')):
-            n = nbt_mod.NBTFile(str(f))
-            ci = _path(n, 'neoforge:attachments', 'curios:inventory', 'Curios')
-            if ci is None:
+    spd = Path(source) / 'playerdata' if source else None
+    if pd.exists() and spd is not None and spd.exists():
+        for sf in sorted(spd.glob('*.dat')):
+            sci = _path(nbt_mod.NBTFile(str(sf)), 'ForgeCaps', 'curios:inventory', 'Curios')
+            if sci is None:
                 continue
-            for c in ci.tags:
-                ident = cget(c, 'Identifier')
-                if ident is not None and ident.value == 'back':
-                    items = _path(c, 'StacksHandler', 'Stacks', 'Items')
-                    chk(f"worn back-slot ({f.name[:8]})", items is not None and len(items.tags) > 0)
+            worn = []
+            for c in sci.tags:
+                items = _path(c, 'StacksHandler', 'Stacks', 'Items')
+                for it in (items.tags if items is not None else []):
+                    iid = cget(it, 'id')
+                    O = _path(it, 'tag', 'contentsUuid')
+                    if iid is not None and is_backpack(iid.value) and O is not None:
+                        worn.append(list(O.value))
+            tf = pd / sf.name
+            if not worn or not tf.exists():
+                continue
+            inv = cget(nbt_mod.NBTFile(str(tf)), 'Inventory')
+            inv_uuids = [list(su.value) for it in (inv.tags if inv is not None else [])
+                         if (su := _path(it, 'components', 'sophisticatedcore:storage_uuid')) is not None
+                         and (iid := cget(it, 'id')) is not None and is_backpack(iid.value)]
+            for O in worn:
+                chk(f"worn backpack -> inventory ({sf.name[:8]})", O in inv_uuids,
+                    '' if O in inv_uuids else 'not relocated into inventory')
 
     # Report
     npass = sum(1 for _, ok, _ in results if ok)

@@ -31,7 +31,7 @@ the correct 1.21 schema, keyed by block position, entity UUID, or storage UUID.
 | Area | Detail |
 |---|---|
 | **Item counts** | Every stack in every mod inventory, world-wide (vaults, funnels, toolboxes, packagers, backpacks, shop displays, filters, …) |
-| **Sophisticated Backpacks** | Placed, inventory, and (best-effort) worn backpacks; contents rehomed to each backpack's storage UUID in `sophisticatedbackpacks.dat`; nested backpacks |
+| **Sophisticated Backpacks** | Placed, inventory, and worn backpacks; storage UUID restored whether the migration left it on the item (rehomed in `sophisticatedbackpacks.dat`) or only in `custom_data` (promoted); a **worn backpack is moved into a free inventory slot** (see limitations); nested backpacks |
 | **Create chain conveyors** | Chain connections restored |
 | **Create tracks** | Connection positions incl. **curved/bezier** segments |
 | **Create track signals** | `TargetTrack` binding + state restored (see limitations) |
@@ -56,10 +56,13 @@ silently lost — see "Auditing" below.
   runtime edge-binding does not reliably reconnect. Easiest fix: **break and
   re-place the signal blocks in-game** (a few seconds each). Editing the track graph
   directly risks derailing a working train, so the tool leaves it alone.
-- **Worn backpacks.** The Curios→Accessories migration drops the equipped item;
-  the tool re-inserts it and restores its contents, but the accessories mod may
-  still reject it on load. **Recommended: have players unequip backpacks before
-  migrating.**
+- **Worn backpacks need a free inventory slot.** The Curios→Accessories
+  migration drops the equipped backpack, and the accessories mod rejects a
+  re-equipped one on load. So the tool instead **moves the worn backpack (with
+  its contents) into a free main-inventory slot**. If the player's inventory is
+  completely full (all 36 slots), there's nowhere to put it and it's skipped
+  (reported as `worn_backpack_no_free_slot`) — players with a full inventory
+  should free a slot, or unequip the backpack, before migrating.
 - **Loose packages in the player inventory.** Create culls package *items* on load.
   Placed packages in the world are fine.
 - **A few uncommon item components inside mod containers** are preserved in
