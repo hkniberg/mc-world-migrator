@@ -77,10 +77,30 @@ silently lost — see "Auditing" below.
 
 1. **Back up everything.** Always work on **copies** of your saves.
 2. Keep your **original 1.20.1 (Forge) save** — it is the source of truth.
-3. Let **1.21.1 / NeoForge open the world once** (this performs the vanilla
-   migration), then quit. Make a copy of that migrated save to patch.
-4. *(Optional but recommended for big worlds)* trim the copy to the chunks you
-   actually keep (e.g. with MCASelector); discarded chunks regenerate fresh in 1.21.
+3. **Force-upgrade the whole world in 1.21.1 / NeoForge** so *every* chunk is
+   converted to the new format — then quit and make a copy of that upgraded save
+   to patch.
+
+   > ⚠️ **Do not just log in and walk around.** Vanilla's DataFixerUpper upgrades a
+   > chunk only when that chunk is *loaded*, so logging in converts only the chunks
+   > near you and leaves every distant chunk in the old 1.20 format. This tool writes
+   > 1.21-schema data; if it patches a chunk that is still at the old `DataVersion`,
+   > Minecraft will later re-run its fixers on that chunk when it finally loads and
+   > can **re-break** what this tool just fixed. Upgrade everything first.
+
+   Use the real full-upgrade path:
+   - **Singleplayer:** world list → select world → **Edit → Optimize World**.
+   - **Dedicated server:** launch once with `--forceUpgrade`, e.g.
+     `java -jar neoforge-server.jar --forceUpgrade --nogui`, and let it finish.
+
+   Both use Minecraft's `WorldUpgrader`: it walks **every region file** in every
+   dimension and re-saves every stored chunk at the current `DataVersion` (it does
+   **not** generate new chunks). **Verify** it reached the far corners before
+   continuing — spot-check the `DataVersion` of a chunk in a region you never
+   personally visited; in 1.21.1 it should read **3955** (1.20.1 was **3465**).
+4. *(Optional but recommended for big worlds)* trim the upgraded copy to the chunks
+   you actually keep (e.g. with MCASelector); discarded chunks regenerate fresh in
+   1.21.
 5. Run the repair with `run` (parallel, resumable; default is a safe **dry-run**,
    add `--write` to apply):
 
