@@ -42,6 +42,36 @@ from nbt.nbt import (
     TAG_Byte_Array, TAG_Long_Array, TAGLIST,
 )
 
+# --- Minecraft NBT strings use Java "modified UTF-8" (CESU-8): NUL is encoded as
+# 0xC0 0x80 and supplementary chars as 6-byte surrogate pairs (0xED prefixes).
+# The `nbt` library uses plain UTF-8 and crashes on such strings (e.g. some
+# backpack/item names in sophisticatedbackpacks.dat). Patch TAG_String to use
+# modified UTF-8 so those .dat files both load and round-trip correctly. ---
+from mutf8 import decode_modified_utf8 as _decode_mutf8, encode_modified_utf8 as _encode_mutf8
+from nbt.nbt import StructError as _StructError
+
+def _tag_string_parse_buffer(self, buffer):
+    length = TAG_Short(buffer=buffer)
+    read = buffer.read(length.value)
+    if len(read) != length.value:
+        raise _StructError()
+    try:
+        self.value = read.decode("utf-8")          # fast path (BMP / ASCII)
+    except UnicodeDecodeError:
+        self.value = _decode_mutf8(read)            # modified UTF-8 (NUL / supplementary)
+
+def _tag_string_render_buffer(self, buffer):
+    try:
+        save_val = _encode_mutf8(self.value)        # always emit modified UTF-8
+    except Exception:
+        save_val = self.value.encode("utf-8")
+    length = TAG_Short(len(save_val))
+    length._render_buffer(buffer)
+    buffer.write(save_val)
+
+TAG_String._parse_buffer = _tag_string_parse_buffer
+TAG_String._render_buffer = _tag_string_render_buffer
+
 
 # ============================================================================
 # NBT helpers
