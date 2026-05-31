@@ -2025,6 +2025,60 @@ def comp_printout(tag):
     return comp
 
 
+def comp_etched_disc(tag):
+    """Etched custom music disc: 1.20 tag.Music{Url,Title,Author} -> 1.21
+    components.etched:music = [{Author, Url}]. (Without this the disc's audio is
+    erased — vanilla dumps Music into custom_data, which Etched doesn't read.)
+    Pattern / LabelColor / DiscColor have no known 1.21 component yet; kept under
+    custom_data so the audio is restored even if the label appearance defaults."""
+    comp = make_compound(name='components')
+    music = cget(tag, 'Music')
+    if music is not None:
+        nl = make_list(TAG_Compound, name='etched:music')
+        e = make_compound()
+        au = cget(music, 'Author')
+        url = cget(music, 'Url')
+        if au is not None:
+            cset(e, 'Author', make_string(au.value))
+        if url is not None:
+            cset(e, 'Url', make_string(url.value))
+        nl.tags.append(e)
+        cset(comp, 'etched:music', nl)
+    leftover = make_compound(name='minecraft:custom_data')
+    for t in tag.tags:
+        if t.name != 'Music':
+            leftover.tags.append(clone(t))
+    if leftover.tags:
+        cset(comp, 'minecraft:custom_data', leftover)
+    return comp
+
+
+def comp_jukebox_upgrade(tag):
+    """Sophisticated jukebox upgrade: SB 1.21 still keeps the disc under
+    minecraft:custom_data.discInventory, but the nested disc must be a 1.21 item.
+    Convert discInventory.Items (Count->count) so the disc isn't read as empty."""
+    comp = make_compound(name='components')
+    cd = make_compound(name='minecraft:custom_data')
+    for t in tag.tags:
+        if t.name == 'discInventory':
+            new_di = make_compound(name='discInventory')
+            size = cget(t, 'Size')
+            if size is not None:
+                cset(new_di, 'Size', clone(size))
+            items = cget(t, 'Items')
+            nl = make_list(TAG_Compound, name='Items')
+            if items is not None:
+                for it in items.tags:
+                    nl.tags.append(convert_item_1_20_to_1_21(it))
+            cset(new_di, 'Items', nl)
+            cset(cd, 'discInventory', new_di)
+        else:
+            cd.tags.append(clone(t))
+    if cd.tags:
+        cset(comp, 'minecraft:custom_data', cd)
+    return comp
+
+
 # id -> legacy-tag->components builder
 MOD_ITEM_CONVERTERS = {
     'create:filter': comp_create_filter,
@@ -2034,6 +2088,9 @@ MOD_ITEM_CONVERTERS = {
     'computercraft:printed_page': comp_printout,
     'computercraft:printed_pages': comp_printout,
     'computercraft:printed_book': comp_printout,
+    'etched:etched_music_disc': comp_etched_disc,
+    'sophisticatedbackpacks:jukebox_upgrade': comp_jukebox_upgrade,
+    'sophisticatedbackpacks:advanced_jukebox_upgrade': comp_jukebox_upgrade,
 }
 
 
