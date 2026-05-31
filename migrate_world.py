@@ -1688,6 +1688,26 @@ def build_components(tag):
     return comp
 
 
+# Item id renames across the 1.20->1.21 jump. Stored items keep the OLD id, so
+# without remapping they resolve to "unknown item" in 1.21 and are dropped on
+# load (the mod is present, but under a new namespace). Keyed by exact id OR by
+# namespace prefix ("ns:" -> "ns2:"). Add entries as more renames surface.
+ITEM_RENAMES = {
+    'some_assembly_required:': 'someassemblyrequired:',  # bread_slice / toasted_bread_slice / ...
+}
+
+
+def _rename_item_id(idval):
+    if not isinstance(idval, str):
+        return idval
+    for old, new in ITEM_RENAMES.items():
+        if old.endswith(':') and idval.startswith(old):
+            return new + idval[len(old):]
+        if idval == old:
+            return new
+    return idval
+
+
 def convert_item_1_20_to_1_21(src):
     """Return a fresh 1.21 item compound from a 1.20 (or already-1.21) item.
 
@@ -1700,13 +1720,14 @@ def convert_item_1_20_to_1_21(src):
     if slot is not None:
         new.tags.append(clone(slot, 'Slot'))
     idt = cget(src, 'id')
+    idval = _rename_item_id(idt.value) if idt is not None else ''
     if idt is not None:
-        cset(new, 'id', make_string(idt.value))
-    cnt = cget(src, 'Count')
-    if cnt is None:
-        cnt = cget(src, 'count')
+        cset(new, 'id', make_string(idval))
+    # Prefer realCount: Sophisticated storage keeps oversized stacks (>127) there
+    # because the 1.20 Count byte overflows; reading Count alone wraps/drops them.
+    rc = cget(src, 'realCount')
+    cnt = rc if rc is not None else (cget(src, 'Count') or cget(src, 'count'))
     cset(new, 'count', make_int(cnt.value if cnt is not None else 1))
-    idval = idt.value if idt is not None else ''
     tag = cget(src, 'tag')
     if tag is not None and len(tag.tags) > 0:
         comp = build_mod_components(idval, tag)
@@ -1898,9 +1919,16 @@ def comp_clipboard(tag):
     return comp
 
 
+def _to_argb(rgb):
+    """1.20 stores backpack colours as RGB (alpha 0); 1.21 expects opaque signed
+    ARGB. Add 0xFF alpha and wrap to a signed 32-bit int."""
+    v = (int(rgb) & 0xFFFFFF) | 0xFF000000
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
 def comp_sophisticated_backpack(tag):
-    """1.20 backpack tag {contentsUuid, inventorySlots, upgradeSlots, renderInfo}
-    -> sophisticatedcore:* components."""
+    """1.20 backpack tag {contentsUuid, inventorySlots, upgradeSlots, renderInfo,
+    clothColor, borderColor} -> sophisticatedcore:* components."""
     comp = make_compound(name='components')
     uuid = cget(tag, 'contentsUuid')
     if uuid is not None:
@@ -1914,10 +1942,21 @@ def comp_sophisticated_backpack(tag):
     ri = cget(tag, 'renderInfo')
     if ri is not None:
         cset(comp, 'sophisticatedcore:render_info_tag', clone(ri, 'sophisticatedcore:render_info_tag'))
+    # Backpack dye colours: 1.20 clothColor/borderColor (RGB) -> 1.21
+    # sophisticatedcore:main_color / accent_color (signed ARGB; add 0xFF alpha).
+    consumed_color = []
+    cloth = cget(tag, 'clothColor')
+    if cloth is not None:
+        cset(comp, 'sophisticatedcore:main_color', make_int(_to_argb(cloth.value)))
+        consumed_color.append('clothColor')
+    border = cget(tag, 'borderColor')
+    if border is not None:
+        cset(comp, 'sophisticatedcore:accent_color', make_int(_to_argb(border.value)))
+        consumed_color.append('borderColor')
     # preserve anything else under custom_data
     leftover = make_compound(name='minecraft:custom_data')
     for t in tag.tags:
-        if t.name not in ('contentsUuid', 'inventorySlots', 'upgradeSlots', 'renderInfo'):
+        if t.name not in ('contentsUuid', 'inventorySlots', 'upgradeSlots', 'renderInfo') + tuple(consumed_color):
             leftover.tags.append(clone(t))
     if leftover.tags:
         cset(comp, 'minecraft:custom_data', leftover)
@@ -2055,14 +2094,20 @@ def _apply_stack(tgt, src, stats):
     conv_count = cget(conv, 'count')
     conv_count_v = conv_count.value if conv_count is not None else 1
     conv_comp = cget(conv, 'components')
-    # A 1.20 'tag' left on the target (force-upgrade doesn't componentize items
-    # inside mod containers) is obsolete once we write components — drop it.
-    has_legacy_tag = cget(tgt, 'tag') is not None
+    # A target still in 1.20 form must be converted even if the count happens to
+    # match: a dedicated-server --forceUpgrade does NOT componentize items inside
+    # mod block-entities, so they arrive as {id,Count[,realCount][,tag]}. The 1.21
+    # game reads `count` (absent) as 1 (or 0=empty), collapsing every stack. The
+    # 1.20 markers below force the rewrite. (Singleplayer "Optimize World" DID
+    # componentize them, which is why this was never hit in testing.)
+    has_legacy = (cget(tgt, 'tag') is not None or cget(tgt, 'Count') is not None
+                  or cget(tgt, 'realCount') is not None)
     if (_tgt_count(tgt) == conv_count_v and nbt_equal(cget(tgt, 'components'), conv_comp)
-            and not has_legacy_tag):
+            and not has_legacy):
         return False
     cset(tgt, 'count', make_int(conv_count_v))
     cdel(tgt, 'Count')
+    cdel(tgt, 'realCount')
     cdel(tgt, 'tag')
     if conv_comp is not None:
         cset(tgt, 'components', conv_comp)
@@ -2222,6 +2267,12 @@ def _xyzslot(e):
 
 
 def _per_be_factory_panel(be, src, stats):
+    # ALWAYS rewrite connections from the 1.20 source (do NOT skip when the target
+    # already has them: a dedicated --forceUpgrade leaves the OLD-format Targeting/
+    # TargetedBy in place, which the 1.21 game then drops on load). Also read the
+    # 1.20 'TargetedByLinks' field — some gauges (restocker mode) store their
+    # incoming links there rather than in 'TargetedBy'; 1.21 consolidates both
+    # into 'TargetedBy'.
     changed = False
     for sn in _PANEL_SLOTS:
         s_slot = cget(src, sn)
@@ -2230,8 +2281,7 @@ def _per_be_factory_panel(be, src, stats):
             continue
         # Targeting: {X,Y,Z,Slot} -> {pos:[x,y,z], slot:<name>}
         s_t = cget(s_slot, 'Targeting')
-        t_t = cget(t_slot, 'Targeting')
-        if s_t is not None and len(s_t.tags) > 0 and (t_t is None or len(t_t.tags) == 0):
+        if s_t is not None and len(s_t.tags) > 0:
             nl = make_list(TAG_Compound, name='Targeting')
             for e in s_t.tags:
                 x, y, z, sl = _xyzslot(e)
@@ -2242,13 +2292,21 @@ def _per_be_factory_panel(be, src, stats):
             cset(t_slot, 'Targeting', nl)
             stats['targeting_fixed'] += 1
             changed = True
-        # TargetedBy: {X,Y,Z,Slot,Amount,ArrowBending} -> {amount,arrow_bending,position{pos,slot}}
-        s_tb = cget(s_slot, 'TargetedBy')
-        t_tb = cget(t_slot, 'TargetedBy')
-        if s_tb is not None and len(s_tb.tags) > 0 and (t_tb is None or len(t_tb.tags) == 0):
+        # TargetedBy + TargetedByLinks -> 1.21 TargetedBy
+        # {X,Y,Z,Slot,Amount,ArrowBending} -> {amount,arrow_bending,position{pos,slot}}
+        src_entries = []
+        for fld in ('TargetedBy', 'TargetedByLinks'):
+            lst = cget(s_slot, fld)
+            if lst is not None:
+                src_entries.extend(lst.tags)
+        if src_entries:
             nl = make_list(TAG_Compound, name='TargetedBy')
-            for e in s_tb.tags:
+            seen = set()
+            for e in src_entries:
                 x, y, z, sl = _xyzslot(e)
+                if (x, y, z, sl) in seen:
+                    continue
+                seen.add((x, y, z, sl))
                 amount = cget(e, 'Amount')
                 bending = cget(e, 'ArrowBending')
                 ne = make_compound()
@@ -3018,6 +3076,13 @@ def fix_playerdata_mod_items(target_world, dry_run):
             tid = cget(it, 'id')
             if tid is None or not isinstance(tid.value, str):
                 return
+            # Rename renamed-namespace items in place (e.g. some_assembly_required ->
+            # someassemblyrequired) so 1.21 doesn't drop them as "unknown". Works on
+            # the still-1.20 playerdata item; login DFU then componentizes it.
+            renamed = _rename_item_id(tid.value)
+            if renamed != tid.value:
+                cset(it, 'id', make_string(renamed))
+                fc[0] = True
             if is_backpack(tid.value):
                 return  # backpacks handled by _global_backpacks
             if mod_converter_for(tid.value) is None:
