@@ -257,6 +257,58 @@ def walk_region(target_dir, kind, visitor, dry_run):
 
 
 # ============================================================================
+# Fixer: mod block-ID renames (chunk block palette, region/ + all dims)
+# ============================================================================
+# Some mods renamed block IDs between their 1.20 and 1.21 builds (e.g. Biomes
+# O' Plenty's maple/autumn leaves). The force-upgrade preserves the old palette
+# strings verbatim — DataFixerUpper has no fixers for mod blocks — but the live
+# 1.21 game turns any ID it can't resolve into AIR the first time the chunk
+# loads. Renaming the palette strings here (after force-upgrade, before the
+# world is ever opened in-game) makes those blocks resolve and survive. It's a
+# pure string swap: block positions, palette indices, Properties, and every
+# other chunk field are untouched. Naturally idempotent (once renamed, the old
+# ID is gone, so a rerun matches nothing). Extend the map as more dead IDs surface.
+BLOCK_RENAMES = {
+    'biomesoplenty:maple_leaves':         'biomesoplenty:red_maple_leaves',
+    'biomesoplenty:orange_autumn_leaves': 'biomesoplenty:orange_maple_leaves',
+    'biomesoplenty:yellow_autumn_leaves': 'biomesoplenty:yellow_maple_leaves',
+}
+
+
+def make_block_renames_visitor(stats):
+    """Rewrite dead mod block IDs in each section's block_states.palette."""
+    def visit(chunk):
+        if not BLOCK_RENAMES:
+            return False
+        sections = cget(chunk, 'sections')
+        if sections is None:
+            return False
+        changed = False
+        for sec in sections.tags:
+            palette = cget(cget(sec, 'block_states'), 'palette')
+            if palette is None:
+                continue
+            for entry in palette.tags:
+                nm = cget(entry, 'Name')
+                if nm is not None and nm.value in BLOCK_RENAMES:
+                    stats[f'block_renamed:{nm.value}'] += 1
+                    nm.value = BLOCK_RENAMES[nm.value]
+                    changed = True
+        return changed
+
+    return visit
+
+
+def fix_block_renames(target, dry_run):
+    """Standalone: rename dead mod block IDs in chunk palettes (debug / overworld)."""
+    print("--- fix_block_renames (mod block palette IDs) ---")
+    stats = Counter()
+    walk_region(target, 'region', make_block_renames_visitor(stats), dry_run)
+    for k, v in sorted(stats.items()):
+        print(f"  {k}: {v}")
+
+
+# ============================================================================
 # Fixer: chain conveyors (block_entities, region/)
 # ============================================================================
 def make_chain_conveyors_visitor(sources, stats):
@@ -2680,6 +2732,7 @@ def migrate_region(dim_subdir, rx, rz, source_world, target_world, dry_run=False
     stats = Counter()
     pairs, claimed = [], []
     region_visitors = [
+        make_block_renames_visitor(stats),
         make_chain_conveyors_visitor(src, stats),
         make_tracks_visitor(src, stats),
         make_track_signals_visitor(src, stats),
@@ -2941,7 +2994,7 @@ SUBCOMMANDS = (
     'fix-paintings', 'fix-item-frames', 'fix-be-backpacks', 'fix-inv-backpacks',
     'fix-inventories', 'fix-fluid-tanks', 'fix-factory-panels', 'fix-table-cloths',
     'fix-clipboards', 'fix-mod-items', 'fix-backpack-dat', 'fix-worn-curios',
-    'fix-backpacks', 'fix-package-entities', 'fix-postboxes',
+    'fix-backpacks', 'fix-package-entities', 'fix-postboxes', 'fix-block-renames',
     'fix-all', 'verify',
     'region', 'run', 'global',
 )
@@ -3001,6 +3054,11 @@ def main():
     if dry:
         print("*** DRY RUN — pass --write to actually modify the target world ***\n")
 
+    # Block-palette renames use a static map, so they don't need the 1.20 source.
+    if args.subcommand == 'fix-block-renames':
+        fix_block_renames(args.target, dry)
+        return
+
     if not args.source:
         ap.error('this subcommand requires --source')
     sources = Sources(args.source)
@@ -3044,6 +3102,8 @@ def main():
     elif args.subcommand == 'fix-postboxes':
         fix_postboxes(args.target, sources, dry)
     elif args.subcommand == 'fix-all':
+        # mod block-ID renames in chunk palettes (must precede live load)
+        fix_block_renames(args.target, dry)
         # structural fixers (reshaped/wiped payloads)
         fix_chain_conveyors(args.target, sources, dry)
         fix_tracks(args.target, sources, dry)

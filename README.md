@@ -43,12 +43,21 @@ the correct 1.21 schema, keyed by block position, entity UUID, or storage UUID.
 | **Create postboxes** | Linked station target |
 | **Item / attribute filters** | `create:filter` and `create:attribute_filter` contents and settings |
 | **Immersive Paintings** | Orientation (facing enum remap — fixes wall→floor) and image (motive id) |
+| **Mod block renames (Biomes O' Plenty leaves)** | Dead 1.20 block IDs in chunk palettes (e.g. `maple_leaves` → `red_maple_leaves`) renamed in place, so the blocks resolve in 1.21 instead of turning to air on load. Pure palette-string swap; positions untouched |
 | **CC: Tweaked printouts** | Text in item frames |
 | **Complex item NBT inside mod containers** | Enchantments, custom names, lore, damage, **written/writable books**, **shulker boxes / containers (recursive)**, **banners & shields** (pattern + colour), potions, trims, etc. |
 
 Anything the item converter doesn't have an explicit rule for is preserved under
 `minecraft:custom_data` (exactly what vanilla does) and **logged**, so nothing is
 silently lost — see "Auditing" below.
+
+> **Block renames** live in the `BLOCK_RENAMES` map at the top of
+> `migrate_world.py`. The force-upgrade keeps unknown mod block IDs in the chunk
+> palette verbatim (DataFixerUpper has no fixers for mod blocks); the live game
+> only drops them — to air — the *first time the chunk loads*. Running this tool
+> in its normal window (after force-upgrade, before opening the world) rewrites
+> those IDs first, so no pre-upgrade step is needed. Add an `old → new` entry to
+> the map for any other mod block that was renamed across the version jump.
 
 ## What it does NOT fix (known limitations)
 
