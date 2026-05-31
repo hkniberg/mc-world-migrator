@@ -2055,10 +2055,15 @@ def _apply_stack(tgt, src, stats):
     conv_count = cget(conv, 'count')
     conv_count_v = conv_count.value if conv_count is not None else 1
     conv_comp = cget(conv, 'components')
-    if _tgt_count(tgt) == conv_count_v and nbt_equal(cget(tgt, 'components'), conv_comp):
+    # A 1.20 'tag' left on the target (force-upgrade doesn't componentize items
+    # inside mod containers) is obsolete once we write components — drop it.
+    has_legacy_tag = cget(tgt, 'tag') is not None
+    if (_tgt_count(tgt) == conv_count_v and nbt_equal(cget(tgt, 'components'), conv_comp)
+            and not has_legacy_tag):
         return False
     cset(tgt, 'count', make_int(conv_count_v))
     cdel(tgt, 'Count')
+    cdel(tgt, 'tag')
     if conv_comp is not None:
         cset(tgt, 'components', conv_comp)
     else:
