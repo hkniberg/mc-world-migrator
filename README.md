@@ -63,6 +63,9 @@ silently lost — see "Auditing" below.
   completely full (all 36 slots), there's nowhere to put it and it's skipped
   (reported as `worn_backpack_no_free_slot`) — players with a full inventory
   should free a slot, or unequip the backpack, before migrating.
+  **NOTE: A improvement for this is implemented but not yet tested: The backpack
+  will in this case be dropped as an entity with despawn timeout disabled
+  on the current location of the user.**
 - **Loose packages in the player inventory.** Create culls package *items* on load.
   Placed packages in the world are fine.
 - **A few uncommon item components inside mod containers** are preserved in
