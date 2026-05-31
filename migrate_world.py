@@ -361,14 +361,14 @@ def make_chain_conveyors_visitor(sources, stats):
                 continue
             stats['source_match'] += 1
 
-            # Check Connections — if non-empty already, skip (idempotent)
-            tgt_conn = cget(be, 'Connections')
+            # Always rewrite Connections from the 1.20 source. (We must NOT skip
+            # when the target already has a non-empty Connections: this Create
+            # version's force-upgrade leaves the OLD-format connections in place,
+            # which Create then drops on load. Source is the source of truth and
+            # the migration runs once, so idempotency is not needed.)
             src_conn = cget(src, 'Connections')
             if src_conn is None or len(src_conn.tags) == 0:
                 stats['source_no_connections'] += 1
-                continue
-            if tgt_conn is not None and len(tgt_conn.tags) > 0:
-                stats['already_fixed'] += 1
                 continue
 
             # Build new Connections: list of Int_Array[3]
@@ -944,6 +944,12 @@ def _bp_handle_present(item, idx, bc, claimed, stats):
          -> promote it: storage_uuid := contentsUuid, whose .dat entry still
          holds the (converted) contents, so no rehome is needed.
     Either way the custom_data residue is cleaned afterwards."""
+    # Playerdata is NOT force-upgraded, so a backpack here is still in 1.20 form
+    # (id/Count/tag). Convert it to 1.21 first (storage_uuid := tag.contentsUuid),
+    # matching what the worn-curios path does; a converted item survives login DFU.
+    if cget(item, 'tag') is not None and cget(item, 'components') is None:
+        conv = convert_item_1_20_to_1_21(item)
+        item.tags = conv.tags
     comps = cget(item, 'components')
     if comps is None:
         return False
@@ -1729,6 +1735,10 @@ def item_no_slot(src):
 # ============================================================================
 def comp_create_filter(tag):
     comp = make_compound(name='components')
+    disp = cget(tag, 'display')
+    nm = cget(disp, 'Name') if disp is not None else None
+    if nm is not None:
+        cset(comp, 'minecraft:custom_name', make_string(_text_component_to_raw(nm.value)))
     fl = make_list(TAG_Compound, name='create:filter_items')
     items_outer = cget(tag, 'Items')
     inner = cget(items_outer, 'Items') if items_outer is not None else None
@@ -1752,6 +1762,10 @@ _ATTR_WM = {0: 'whitelist_disj', 1: 'whitelist_conj', 2: 'blacklist'}
 
 def comp_attribute_filter(tag):
     comp = make_compound(name='components')
+    disp = cget(tag, 'display')
+    nm = cget(disp, 'Name') if disp is not None else None
+    if nm is not None:
+        cset(comp, 'minecraft:custom_name', make_string(_text_component_to_raw(nm.value)))
     wm = cget(tag, 'WhitelistMode')
     cset(comp, 'create:attribute_filter_whitelist_mode',
          make_string(_ATTR_WM.get(wm.value if wm is not None else 0, 'whitelist_disj')))
@@ -1761,11 +1775,18 @@ def comp_attribute_filter(tag):
         for e in ma.tags:
             inv = cget(e, 'Inverted')
             aid = cget(e, 'attributeId')
+            mod = cget(e, 'modId')
             ne = make_compound()
             cset(ne, 'inverted', make_byte(inv.value if inv is not None else 0))
             attr = make_compound(name='attribute')
             cset(attr, 'type', make_string(aid.value if aid is not None else ''))
-            cset(attr, 'value', make_compound())
+            # 1.21 stores the attribute parameter in `value`: for parameterised
+            # attributes (e.g. create:added_by) it's the modId STRING; for
+            # parameterless ones (compostable, consumable, ...) an empty compound.
+            if mod is not None:
+                cset(attr, 'value', make_string(mod.value))
+            else:
+                cset(attr, 'value', make_compound())
             cset(ne, 'attribute', attr)
             nl.tags.append(ne)
     cset(comp, 'create:attribute_filter_matched_attributes', nl)
@@ -1903,11 +1924,77 @@ def comp_sophisticated_backpack(tag):
     return comp
 
 
+def comp_disk(tag):
+    """CC:Tweaked floppy disk: DiskId -> computercraft:disk_id, Color(int) ->
+    minecraft:dyed_color. (Disk contents live in world/computercraft/disk/<id>.)"""
+    comp = build_components(tag)
+    cd = cget(comp, 'minecraft:custom_data')
+    if cd is not None:
+        did = cget(cd, 'DiskId')
+        if did is not None:
+            cset(comp, 'computercraft:disk_id', make_int(did.value))
+            cdel(cd, 'DiskId')
+        col = cget(cd, 'Color')
+        if col is not None:
+            dyed = make_compound(name='minecraft:dyed_color')
+            cset(dyed, 'rgb', make_int(col.value))
+            cset(dyed, 'show_in_tooltip', make_byte(0))
+            cset(comp, 'minecraft:dyed_color', dyed)
+            cdel(cd, 'Color')
+        if not cd.tags:
+            cdel(comp, 'minecraft:custom_data')
+    return comp
+
+
+def comp_pocket_computer(tag):
+    """CC:Tweaked pocket computer: ComputerId -> computercraft:computer_id,
+    On -> computercraft:on. (State lives in world/computercraft/computer/<id>.)
+    SessionId/InstanceId are runtime-only and dropped; Upgrade etc. preserved."""
+    comp = build_components(tag)
+    cd = cget(comp, 'minecraft:custom_data')
+    if cd is not None:
+        cid = cget(cd, 'ComputerId')
+        if cid is not None:
+            cset(comp, 'computercraft:computer_id', make_int(cid.value))
+            cdel(cd, 'ComputerId')
+        on = cget(cd, 'On')
+        if on is not None:
+            cset(comp, 'computercraft:on', make_byte(on.value))
+            cdel(cd, 'On')
+        cdel(cd, 'SessionId')
+        cdel(cd, 'InstanceId')
+        if not cd.tags:
+            cdel(comp, 'minecraft:custom_data')
+    return comp
+
+
+def comp_printout(tag):
+    """CC:Tweaked printed page/pages/book: Title + Text/Color lines ->
+    computercraft:printout. (Same builder as the item-frame fixer.)"""
+    comp = build_components(tag)
+    cd = cget(comp, 'minecraft:custom_data')
+    if cd is not None:
+        po = build_printout_component(cd)
+        if po is not None:
+            cset(comp, 'computercraft:printout', po)
+            for t in list(cd.tags):
+                if t.name and (t.name.startswith('Text') or t.name.startswith('Color')
+                               or t.name in ('Title', 'Pages')):
+                    cdel(cd, t.name)
+            if not cd.tags:
+                cdel(comp, 'minecraft:custom_data')
+    return comp
+
+
 # id -> legacy-tag->components builder
 MOD_ITEM_CONVERTERS = {
     'create:filter': comp_create_filter,
     'create:attribute_filter': comp_attribute_filter,
     'create:clipboard': comp_clipboard,
+    'computercraft:disk': comp_disk,
+    'computercraft:printed_page': comp_printout,
+    'computercraft:printed_pages': comp_printout,
+    'computercraft:printed_book': comp_printout,
 }
 
 
@@ -1918,6 +2005,8 @@ def mod_converter_for(idval):
         return comp_package
     if idval.startswith('sophisticatedbackpacks:') and 'backpack' in idval:
         return comp_sophisticated_backpack
+    if idval.startswith('computercraft:') and 'pocket_computer' in idval:
+        return comp_pocket_computer
     return None
 
 
@@ -2301,6 +2390,27 @@ def _per_be_postbox(be, src, stats):
     return True
 
 
+def _per_be_stock_ticker(be, src, stats):
+    """Rebuild a stock ticker's filter tabs from the 1.20 source. Create's own
+    migration reshapes the Categories items but loses parameterised attributes
+    (create:added_by's modId) and filter display names, so rewrite from source.
+    The items are converted via the (fixed) mod-item filter builders."""
+    changed = False
+    for field in ('Categories', 'HiddenCategories'):
+        src_list = cget(src, field)
+        if src_list is None or len(src_list.tags) == 0:
+            continue
+        nl = make_list(TAG_Compound, name=field)
+        for sc in src_list.tags:
+            nl.tags.append(convert_item_1_20_to_1_21(sc))
+        cset(be, field, nl)
+        stats['categories_rebuilt'] += len(nl.tags)
+        changed = True
+    if changed:
+        stats['fixed'] += 1
+    return changed
+
+
 def fix_postboxes(target, sources, dry_run):
     """Restore the postbox Target (linked station) lost on migration."""
     print("--- fix_postboxes ---")
@@ -2336,9 +2446,13 @@ def reconstruct_from_custom_data(item, stats):
     # package that keeps its contents.
     if 'package' in tid.value:
         cdel(new_comp, 'create:package_order_data')
+    # If the builder produced its own (cleaned) leftover custom_data, let it
+    # replace the original; otherwise clear the now-consumed custom_data.
+    had_leftover = cget(new_comp, 'minecraft:custom_data') is not None
     for t in new_comp.tags:
         cset(components, t.name, t)
-    cdel(components, 'minecraft:custom_data')
+    if not had_leftover:
+        cdel(components, 'minecraft:custom_data')
     stats['mod_items_rebuilt'] += 1
     return True
 
@@ -2771,6 +2885,7 @@ def migrate_region(dim_subdir, rx, rz, source_world, target_world, dry_run=False
         make_be_fixer_visitor(src, stats, 'create:table_cloth', _per_be_table_cloth),
         make_be_fixer_visitor(src, stats, 'create:clipboard', _per_be_clipboard),
         make_be_fixer_visitor(src, stats, 'create:package_postbox', _per_be_postbox),
+        make_be_fixer_visitor(src, stats, 'create:stock_ticker', _per_be_stock_ticker),
         make_inventories_visitor(src, stats),
         make_be_backpacks_visitor(src, stats),
         make_mod_items_visitor(src, stats),
@@ -2874,11 +2989,57 @@ def _global_backpacks(source_world, target_world, region_pairs, region_claimed, 
         print(f"  {k}: {v}")
 
 
+def fix_playerdata_mod_items(target_world, dry_run):
+    """Rebuild mod-item components for NON-backpack mod items in playerdata
+    (CC disks/pocket computers/printouts, Create filters/clipboards/packages).
+    Playerdata isn't force-upgraded, so items are still 1.20 (id/Count/tag) ->
+    convert them to 1.21 here (they survive login DFU); already-1.21 items with a
+    legacy custom_data residue are reconstructed instead."""
+    print("--- fix_playerdata_mod_items ---")
+    stats = Counter()
+    pd = Path(target_world) / 'playerdata'
+    if not pd.exists():
+        print("  (no playerdata/)")
+        return
+    for f in sorted(pd.glob('*.dat')):
+        try:
+            n = nbt_mod.NBTFile(str(f))
+        except Exception as e:
+            print(f"  !! open {f.name}: {e}")
+            continue
+        fc = [False]
+
+        def on_item(it):
+            tid = cget(it, 'id')
+            if tid is None or not isinstance(tid.value, str):
+                return
+            if is_backpack(tid.value):
+                return  # backpacks handled by _global_backpacks
+            if mod_converter_for(tid.value) is None:
+                return
+            if cget(it, 'tag') is not None and cget(it, 'components') is None:
+                conv = convert_item_1_20_to_1_21(it)
+                it.tags = conv.tags
+                stats['converted_1_20'] += 1
+                fc[0] = True
+            elif reconstruct_from_custom_data(it, stats):
+                fc[0] = True
+
+        walk_items(n, on_item)
+        if fc[0]:
+            print(f"  {f.name}: {'rewriting' if not dry_run else 'WOULD rewrite'}")
+            if not dry_run:
+                n.write_file(str(f))
+    for k, v in sorted(stats.items()):
+        print(f"  {k}: {v}")
+
+
 def migrate_global(source_world, target_world, region_pairs, region_claimed, dry_run=False):
     """The only serial / world-global work: sophisticatedbackpacks.dat and playerdata."""
     print("--- migrate_global (.dat + playerdata) ---")
     fix_backpack_dat(target_world, dry_run)
     _global_backpacks(source_world, target_world, region_pairs, region_claimed, dry_run)
+    fix_playerdata_mod_items(target_world, dry_run)
     stats = fix_mod_items_playerdata(target_world, dry_run)
     for k, v in sorted(stats.items()):
         print(f"  mod_items {k}: {v}")
