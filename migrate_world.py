@@ -2236,6 +2236,44 @@ def make_inventories_visitor(sources, stats):
     return visit
 
 
+def make_deep_nested_visitor(stats, list_key='block_entities'):
+    """Finish the conversion the dedicated-server --forceUpgrade leaves undone for
+    item stacks NESTED inside mod data: Create contraption storage (in custom_data
+    > Contraption > ... > Items), AE2 patterns & storage cells (custom_data >
+    in/out/keys/list), Some-Assembly-Required sandwich layers (block_entity_data >
+    Sandwich), loaded crossbows (custom_data > ChargedProjectiles), depot/packager
+    held items, ... DFU does not recurse into these opaque mod blobs, and the
+    source-matched restore_stacks_parallel above stops where the converted-target
+    and 1.20-source trees diverge, so the inner stacks survive as raw 1.20
+    {id,Count[,tag]}. In 1.21 a stack with no `count` reads as 1 (or 0=empty), and
+    a stale-namespace id (some_assembly_required:) is dropped outright.
+
+    walk_items recurses into an item's children AFTER on_item mutates it, so a
+    single pass converts arbitrarily deep nesting. Target-only (no source needed):
+    for these nested stacks the 1.20 Count byte IS the true count (they are not
+    Sophisticated oversized storage, which lives in .dat keyed by UUID). Idempotent
+    -- a stack already in 1.21 form (has `count`, no `Count`/`tag`) is skipped, so
+    this never clobbers a realCount-restored stack from the source pass."""
+    def on_item(it):
+        legacy = cget(it, 'Count') is not None or \
+            (cget(it, 'tag') is not None and cget(it, 'components') is None)
+        if not legacy:
+            return
+        conv = convert_item_1_20_to_1_21(it)
+        it.tags = conv.tags
+        stats['deep_nested_converted'] += 1
+
+    def visit(chunk):
+        lst = cget(chunk, list_key)
+        if lst is None:
+            return False
+        before = stats['deep_nested_converted']
+        walk_items(lst, on_item)
+        return stats['deep_nested_converted'] > before
+
+    return visit
+
+
 def fix_inventories(target, sources, dry_run):
     """Generic count/contents restore across all matched block entities."""
     print("--- fix_inventories (generic mod-inventory sweep) ---")
@@ -3009,12 +3047,14 @@ def migrate_region(dim_subdir, rx, rz, source_world, target_world, dry_run=False
         make_inventories_visitor(src, stats),
         make_be_backpacks_visitor(src, stats),
         make_mod_items_visitor(src, stats),
+        make_deep_nested_visitor(stats, 'block_entities'),
         make_backpack_collect_visitor(stats, pairs, claimed),
     ]
     entity_visitors = [
         make_paintings_visitor(src, stats),
         make_item_frames_visitor(src, stats),
         make_package_entities_visitor(src, stats),
+        make_deep_nested_visitor(stats, 'Entities'),
     ]
     base = _dim_base(target_world, dim_subdir)
     rc, rm = _process_region_file(base / 'region' / f'r.{rx}.{rz}.mca', region_visitors, dry_run)
