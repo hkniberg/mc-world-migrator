@@ -27,8 +27,10 @@ import re
 import json
 import random
 import shutil
+import struct
 import time
 import traceback
+import uuid
 from pathlib import Path
 from collections import defaultdict, Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -101,6 +103,18 @@ def make_string(value, name=''):
 def make_double(value, name=''):
     t = TAG_Double(name=name)
     t.value = float(value)
+    return t
+
+
+def make_float(value, name=''):
+    t = TAG_Float(name=name)
+    t.value = float(value)
+    return t
+
+
+def make_short(value, name=''):
+    t = TAG_Short(name=name)
+    t.value = int(value)
     return t
 
 
@@ -886,6 +900,90 @@ def _bp_pick_empty(idx, claimed):
     return None
 
 
+# Mapping from playerdata Dimension strings to world sub-directory prefixes.
+_MC_DIM_TO_SUBDIR = {
+    'minecraft:overworld': '',
+    'minecraft:the_nether': 'DIM-1',
+    'minecraft:the_end': 'DIM1',
+}
+
+
+def make_item_entity(item_1_21, pos_xyz):
+    """Build a minecraft:item entity compound for a dropped item at pos_xyz.
+    Age=-32768 prevents despawn so the player is guaranteed to find it."""
+    uid = list(struct.unpack('>4i', uuid.uuid4().bytes))
+    e = make_compound()
+    cset(e, 'id', make_string('minecraft:item'))
+    cset(e, 'UUID', make_ia(uid))
+    pos = make_list(TAG_Double, name='Pos')
+    for v in pos_xyz:
+        pos.tags.append(make_double(v))
+    cset(e, 'Pos', pos)
+    motion = make_list(TAG_Double, name='Motion')
+    for _ in range(3):
+        motion.tags.append(make_double(0.0))
+    cset(e, 'Motion', motion)
+    rot = make_list(TAG_Float, name='Rotation')
+    rot.tags.append(make_float(0.0))
+    rot.tags.append(make_float(0.0))
+    cset(e, 'Rotation', rot)
+    cset(e, 'Age', make_short(-32768))
+    cset(e, 'PickupDelay', make_short(0))
+    item_copy = clone(item_1_21, name='Item')
+    cdel(item_copy, 'Slot')
+    cset(e, 'Item', item_copy)
+    return e
+
+
+def _spawn_item_in_entities(target_world, dim_str, pos_xyz, item_1_21, dry_run, stats):
+    """Append a minecraft:item entity to the entities region chunk at pos_xyz.
+    Returns True if the chunk was found and (unless dry_run) written."""
+    dim_subdir = _MC_DIM_TO_SUBDIR.get(dim_str, '')
+    if dim_str not in _MC_DIM_TO_SUBDIR:
+        print(f"  !! unknown dimension '{dim_str}', defaulting to overworld for backpack spawn")
+
+    px, py, pz = pos_xyz
+    cx = int(px // 16)
+    cz = int(pz // 16)
+    rx = cx // 32
+    rz = cz // 32
+    lcx = cx % 32
+    lcz = cz % 32
+
+    ents_dir = _dim_base(target_world, dim_subdir) / 'entities'
+    rpath = ents_dir / f'r.{rx}.{rz}.mca'
+    if not rpath.exists():
+        print(f"  !! {rpath} not found — worn backpack spawn failed (free a slot and re-run)")
+        stats['worn_backpack_spawn_failed'] += 1
+        return False
+
+    try:
+        rf = region.RegionFile(str(rpath))
+        chunk = rf.get_chunk(lcx, lcz)
+    except Exception as e:
+        print(f"  !! chunk ({lcx},{lcz}) in {rpath.name}: {e} — worn backpack spawn failed")
+        stats['worn_backpack_spawn_failed'] += 1
+        return False
+
+    if chunk is None:
+        print(f"  !! chunk ({lcx},{lcz}) absent in {rpath.name} — worn backpack spawn failed")
+        stats['worn_backpack_spawn_failed'] += 1
+        return False
+
+    ents = cget(chunk, 'Entities')
+    if ents is None:
+        ents = make_list(TAG_Compound, name='Entities')
+        cset(chunk, 'Entities', ents)
+
+    entity = make_item_entity(item_1_21, [px, py + 0.5, pz])
+    ents.tags.append(entity)
+    print(f"  spawning worn backpack at ({px:.1f}, {py + 0.5:.1f}, {pz:.1f}) in {rpath.name}")
+    if not dry_run:
+        rf.write_chunk(lcx, lcz, chunk)
+    stats['worn_backpack_spawned'] += 1
+    return True
+
+
 def _free_inv_slots(n):
     """Main-inventory slots (0-35) not currently occupied in this player .dat.
     Armor (100-103) and offhand (-106) are excluded by construction."""
@@ -917,13 +1015,17 @@ def _inv_has_backpack_uuid(n, uuid_val):
     return False
 
 
-def _bp_relocate_worn(n, src_item, stats):
+def _bp_relocate_worn(n, src_item, stats, overflow=None):
     """Place a worn-backpack item into a free main-inventory slot of player n
     instead of re-equipping it. The Accessories/SB mod drops a re-equipped
     backpack on load, but an ordinary inventory item survives and keeps its
     contents: the converted item carries sophisticatedcore:storage_uuid =
     the original contentsUuid, and .dat[contentsUuid] (converted by
     fix_backpack_dat) still holds the contents -- so no rehome is needed.
+
+    If the inventory is full and overflow is provided, appends
+    (item, pos_xyz, dim_str) to overflow so the caller can spawn the backpack
+    as a ground entity at the player's location instead of losing it.
 
     Idempotent: skips if a backpack with the same storage_uuid is already in the
     inventory. Returns True only when it actually appends the item."""
@@ -940,6 +1042,13 @@ def _bp_relocate_worn(n, src_item, stats):
     free = _free_inv_slots(n)
     if not free:
         stats['worn_backpack_no_free_slot'] += 1
+        if overflow is not None:
+            pos_tag = cget(n, 'Pos')
+            dim_tag = cget(n, 'Dimension')
+            if pos_tag is not None:
+                pos_xyz = [t.value for t in pos_tag.tags]
+                dim_str = dim_tag.value if dim_tag is not None else 'minecraft:overworld'
+                overflow.append((conv, pos_xyz, dim_str))
         return False
     cset(conv, 'Slot', make_byte(free[0]))
     inv.tags.append(conv)
@@ -1078,13 +1187,16 @@ def fix_backpacks(target, sources, dry_run):
         print(f"  {k}: {v}")
 
 
-def _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
+def _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats, overflow=None):
     """Recover worn items the Curios -> NeoForge-Accessories migration dropped.
 
     Worn BACKPACKS are relocated into a free main-inventory slot (see
     _bp_relocate_worn) rather than re-equipped, because the accessories mod
     rejects a re-equipped backpack on load. Any OTHER worn curio is restored
-    into its matching target curios attachment slot, as before."""
+    into its matching target curios attachment slot, as before.
+
+    overflow, if provided, receives (item, pos_xyz, dim_str) tuples for any
+    backpack that could not be placed due to a full inventory."""
     fc = cget(src_nbt, 'ForgeCaps')
     src_ci = cget(fc, 'curios:inventory') if fc is not None else None
     src_curios = cget(src_ci, 'Curios') if src_ci is not None else None
@@ -1107,7 +1219,7 @@ def _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
         for it in s_items.tags:
             iid = cget(it, 'id')
             if iid is not None and is_backpack(iid.value):
-                if _bp_relocate_worn(n, it, stats):
+                if _bp_relocate_worn(n, it, stats, overflow=overflow):
                     changed = True
             else:
                 rest.append(it)
@@ -2638,6 +2750,7 @@ def _global_backpacks(source_world, target_world, region_pairs, region_claimed, 
                 src_pd[f.name] = nbt_mod.NBTFile(str(f))
             except Exception:
                 pass
+    overflow = []  # (item_1_21, pos_xyz, dim_str) for backpacks that couldn't fit in inventory
     pd = Path(target_world) / 'playerdata'
     if pd.exists():
         for f in sorted(pd.glob('*.dat')):
@@ -2657,13 +2770,18 @@ def _global_backpacks(source_world, target_world, region_pairs, region_claimed, 
 
             walk_items(n, on_item)
             src_nbt = src_pd.get(f.name)
-            if src_nbt is not None and _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats):
+            if src_nbt is not None and _bp_restore_worn(n, src_nbt, idx, bc, claimed, stats,
+                                                        overflow=overflow):
                 fc[0] = True
                 dat_changed[0] = True
             if fc[0]:
                 print(f"  {f.name}: {'rewriting' if not dry_run else 'WOULD rewrite'}")
                 if not dry_run:
                     n.write_file(str(f))
+
+    # Spawn worn backpacks that couldn't fit into a full inventory as ground entities.
+    for item, pos_xyz, dim_str in overflow:
+        _spawn_item_in_entities(target_world, dim_str, pos_xyz, item, dry_run, stats)
 
     if dat_changed[0]:
         print(f"  sophisticatedbackpacks.dat: {'rewriting' if not dry_run else 'WOULD rewrite'}")
