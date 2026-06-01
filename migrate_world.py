@@ -172,6 +172,29 @@ def xyz_compound_to_ia(c, name=''):
 # ============================================================================
 # Sources index
 # ============================================================================
+def _open_region_ro(path):
+    """Open a region file READ-ONLY via a file object.
+
+    The nbt library's RegionFile(str path) opens 'r+b' (read-write), which raises
+    PermissionError on a read-only source world. Callers used to swallow that
+    silently, leaving the source index EMPTY so every source-of-truth fix
+    (chains, tracks, factory panels, ...) no-op'd while the run still looked
+    successful. Opening through a 'rb' file object works on a frozen source and
+    guarantees we never mutate it. Returns (RegionFile, fileobj); the caller must
+    close fileobj. Returns (None, None) only if the file genuinely can't be read."""
+    fo = None
+    try:
+        fo = open(str(path), 'rb')
+        return region.RegionFile(fileobj=fo), fo
+    except Exception:
+        if fo is not None:
+            try:
+                fo.close()
+            except Exception:
+                pass
+        return None, None
+
+
 class Sources:
     """Index the 1.20 source world for fast lookup."""
 
@@ -186,48 +209,52 @@ class Sources:
         rdir = self.world / 'region'
         if rdir.exists():
             for f in sorted(rdir.glob('*.mca')):
-                try:
-                    rf = region.RegionFile(str(f))
-                except Exception:
+                rf, fo = _open_region_ro(f)
+                if rf is None:
                     continue
-                for entry in rf.get_chunk_coords():
-                    try:
-                        chunk = rf.get_chunk(entry['x'], entry['z'])
-                    except Exception:
-                        continue
-                    if chunk is None:
-                        continue
-                    bes = cget(chunk, 'block_entities')
-                    if bes is None:
-                        continue
-                    for be in bes.tags:
-                        tid = cget(be, 'id')
-                        x = cget(be, 'x')
-                        y = cget(be, 'y')
-                        z = cget(be, 'z')
-                        if tid and x and y and z:
-                            self.be_by_xyz[(tid.value, x.value, y.value, z.value)] = be
+                try:
+                    for entry in rf.get_chunk_coords():
+                        try:
+                            chunk = rf.get_chunk(entry['x'], entry['z'])
+                        except Exception:
+                            continue
+                        if chunk is None:
+                            continue
+                        bes = cget(chunk, 'block_entities')
+                        if bes is None:
+                            continue
+                        for be in bes.tags:
+                            tid = cget(be, 'id')
+                            x = cget(be, 'x')
+                            y = cget(be, 'y')
+                            z = cget(be, 'z')
+                            if tid and x and y and z:
+                                self.be_by_xyz[(tid.value, x.value, y.value, z.value)] = be
+                finally:
+                    fo.close()
         edir = self.world / 'entities'
         if edir.exists():
             for f in sorted(edir.glob('*.mca')):
-                try:
-                    rf = region.RegionFile(str(f))
-                except Exception:
+                rf, fo = _open_region_ro(f)
+                if rf is None:
                     continue
-                for entry in rf.get_chunk_coords():
-                    try:
-                        chunk = rf.get_chunk(entry['x'], entry['z'])
-                    except Exception:
-                        continue
-                    if chunk is None:
-                        continue
-                    ents = cget(chunk, 'Entities')
-                    if ents is None:
-                        continue
-                    for ent in ents.tags:
-                        u = cget(ent, 'UUID')
-                        if u:
-                            self.ent_by_uuid[tuple(u.value)] = ent
+                try:
+                    for entry in rf.get_chunk_coords():
+                        try:
+                            chunk = rf.get_chunk(entry['x'], entry['z'])
+                        except Exception:
+                            continue
+                        if chunk is None:
+                            continue
+                        ents = cget(chunk, 'Entities')
+                        if ents is None:
+                            continue
+                        for ent in ents.tags:
+                            u = cget(ent, 'UUID')
+                            if u:
+                                self.ent_by_uuid[tuple(u.value)] = ent
+                finally:
+                    fo.close()
         pd = self.world / 'playerdata'
         if pd.exists():
             for f in sorted(pd.glob('*.dat')):
@@ -2949,22 +2976,24 @@ class RegionSources:
     def _index(self, path, list_key, add):
         if not path.exists():
             return
-        try:
-            rf = region.RegionFile(str(path))
-        except Exception:
+        rf, fo = _open_region_ro(path)
+        if rf is None:
             return
-        for entry in rf.get_chunk_coords():
-            try:
-                chunk = rf.get_chunk(entry['x'], entry['z'])
-            except Exception:
-                continue
-            if chunk is None:
-                continue
-            lst = cget(chunk, list_key)
-            if lst is None:
-                continue
-            for item in lst.tags:
-                add(item)
+        try:
+            for entry in rf.get_chunk_coords():
+                try:
+                    chunk = rf.get_chunk(entry['x'], entry['z'])
+                except Exception:
+                    continue
+                if chunk is None:
+                    continue
+                lst = cget(chunk, list_key)
+                if lst is None:
+                    continue
+                for item in lst.tags:
+                    add(item)
+        finally:
+            fo.close()
 
     def _add_be(self, be):
         tid, x, y, z = cget(be, 'id'), cget(be, 'x'), cget(be, 'y'), cget(be, 'z')
